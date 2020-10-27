@@ -13,9 +13,11 @@
  *
  */
 
-#ifndef RGW_REST_LOG_H
-#define RGW_REST_LOG_H
+#pragma once
 
+#include "rgw_datalog.h"
+#include "rgw_rest.h"
+#include "rgw_rest_s3.h"
 #include "rgw_metadata.h"
 #include "rgw_mdlog.h"
 
@@ -25,11 +27,11 @@ public:
   RGWOp_BILog_List() : sent_header(false) {}
   ~RGWOp_BILog_List() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("bilog", RGW_CAP_READ);
   }
   int verify_permission() override {
-    return check_caps(s->user->caps);
+    return check_caps(s->user->get_caps());
   }
   void send_response() override;
   virtual void send_response(list<rgw_bi_log_entry>& entries, string& marker);
@@ -49,11 +51,11 @@ public:
   RGWOp_BILog_Info() : bucket_ver(), master_ver(), syncstopped(false) {}
   ~RGWOp_BILog_Info() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("bilog", RGW_CAP_READ);
   }
   int verify_permission() override {
-    return check_caps(s->user->caps);
+    return check_caps(s->user->get_caps());
   }
   void send_response() override;
   void execute() override;
@@ -67,7 +69,7 @@ public:
   RGWOp_BILog_Delete() {}
   ~RGWOp_BILog_Delete() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("bilog", RGW_CAP_WRITE);
   }
   void execute() override;
@@ -84,11 +86,11 @@ public:
   RGWOp_MDLog_List() : truncated(false) {}
   ~RGWOp_MDLog_List() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("mdlog", RGW_CAP_READ);
   }
   int verify_permission() override {
-    return check_caps(s->user->caps);
+    return check_caps(s->user->get_caps());
   }
   void execute() override;
   void send_response() override;
@@ -104,11 +106,11 @@ public:
   RGWOp_MDLog_Info() : num_objects(0) {}
   ~RGWOp_MDLog_Info() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("mdlog", RGW_CAP_READ);
   }
   int verify_permission() override {
-    return check_caps(s->user->caps);
+    return check_caps(s->user->get_caps());
   }
   void execute() override;
   void send_response() override;
@@ -123,11 +125,11 @@ public:
   RGWOp_MDLog_ShardInfo() {}
   ~RGWOp_MDLog_ShardInfo() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("mdlog", RGW_CAP_READ);
   }
   int verify_permission() override {
-    return check_caps(s->user->caps);
+    return check_caps(s->user->get_caps());
   }
   void execute() override;
   void send_response() override;
@@ -141,7 +143,7 @@ public:
   RGWOp_MDLog_Lock() {}
   ~RGWOp_MDLog_Lock() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("mdlog", RGW_CAP_WRITE);
   }
   void execute() override;
@@ -155,7 +157,7 @@ public:
   RGWOp_MDLog_Unlock() {}
   ~RGWOp_MDLog_Unlock() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("mdlog", RGW_CAP_WRITE);
   }
   void execute() override;
@@ -169,7 +171,7 @@ public:
   RGWOp_MDLog_Notify() {}
   ~RGWOp_MDLog_Notify() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("mdlog", RGW_CAP_WRITE);
   }
   void execute() override;
@@ -183,7 +185,7 @@ public:
   RGWOp_MDLog_Delete() {}
   ~RGWOp_MDLog_Delete() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("mdlog", RGW_CAP_WRITE);
   }
   void execute() override;
@@ -193,19 +195,19 @@ public:
 };
 
 class RGWOp_DATALog_List : public RGWRESTOp {
-  list<rgw_data_change_log_entry> entries;
-  string last_marker;
+  std::vector<rgw_data_change_log_entry> entries;
+  std::string last_marker;
   bool truncated;
   bool extra_info;
 public:
   RGWOp_DATALog_List() : truncated(false), extra_info(false) {}
   ~RGWOp_DATALog_List() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("datalog", RGW_CAP_READ);
   }
   int verify_permission() override {
-    return check_caps(s->user->caps);
+    return check_caps(s->user->get_caps());
   }
   void execute() override;
   void send_response() override;
@@ -220,11 +222,11 @@ public:
   RGWOp_DATALog_Info() : num_objects(0) {}
   ~RGWOp_DATALog_Info() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("datalog", RGW_CAP_READ);
   }
   int verify_permission() override {
-    return check_caps(s->user->caps);
+    return check_caps(s->user->get_caps());
   }
   void execute() override;
   void send_response() override;
@@ -239,11 +241,11 @@ public:
   RGWOp_DATALog_ShardInfo() {}
   ~RGWOp_DATALog_ShardInfo() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("datalog", RGW_CAP_READ);
   }
   int verify_permission() override {
-    return check_caps(s->user->caps);
+    return check_caps(s->user->get_caps());
   }
   void execute() override;
   void send_response() override;
@@ -257,7 +259,7 @@ public:
   RGWOp_DATALog_Notify() {}
   ~RGWOp_DATALog_Notify() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("datalog", RGW_CAP_WRITE);
   }
   void execute() override;
@@ -271,7 +273,7 @@ public:
   RGWOp_DATALog_Delete() {}
   ~RGWOp_DATALog_Delete() override {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("datalog", RGW_CAP_WRITE);
   }
   void execute() override;
@@ -299,11 +301,10 @@ public:
   RGWRESTMgr_Log() = default;
   ~RGWRESTMgr_Log() override = default;
 
-  RGWHandler_REST* get_handler(struct req_state* const,
+  RGWHandler_REST* get_handler(rgw::sal::RGWRadosStore *store,
+			       struct req_state* const,
                                const rgw::auth::StrategyRegistry& auth_registry,
                                const std::string& frontend_prefixs) override {
     return new RGWHandler_Log(auth_registry);
   }
 };
-
-#endif /* RGW_REST_LOG_H */

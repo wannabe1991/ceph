@@ -20,7 +20,9 @@
 #undef dout_prefix
 #define dout_prefix *_dout << "timer(" << this << ")."
 
+using std::pair;
 
+using ceph::operator <<;
 
 class SafeTimerThread : public Thread {
   SafeTimer *parent;
@@ -105,7 +107,8 @@ void SafeTimer::timer_thread()
     if (schedule.empty()) {
       cond.wait(l);
     } else {
-      cond.wait_until(l, schedule.begin()->first);
+      auto when = schedule.begin()->first;
+      cond.wait_until(l, when);
     }
     ldout(cct,20) << "timer_thread awake" << dendl;
   }

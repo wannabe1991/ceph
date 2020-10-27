@@ -42,7 +42,9 @@ class MonClient;
 
 class MDSDaemon : public Dispatcher {
  public:
-  MDSDaemon(std::string_view n, Messenger *m, MonClient *mc);
+  MDSDaemon(std::string_view n, Messenger *m, MonClient *mc,
+	    boost::asio::io_context& ioctx);
+
   ~MDSDaemon() override;
 
   mono_time get_starttime() const {
@@ -93,8 +95,12 @@ class MDSDaemon : public Dispatcher {
   void set_up_admin_socket();
   void clean_up_admin_socket();
   void check_ops_in_flight(); // send off any slow ops to monitor
-  int asok_command(std::string_view command, const cmdmap_t& cmdmap,
-		   Formatter *f, ostream& ss);
+  void asok_command(
+    std::string_view command,
+    const cmdmap_t& cmdmap,
+    Formatter *f,
+    const bufferlist &inbl,
+    std::function<void(int,const std::string&,bufferlist&)> on_finish);
 
   void dump_status(Formatter *f);
 
@@ -116,18 +122,8 @@ class MDSDaemon : public Dispatcher {
 
   bool handle_core_message(const cref_t<Message> &m);
   
-  static void send_command_reply(const cref_t<MCommand> &m, MDSRank* mds_rank, int r,
-				 bufferlist outbl, std::string_view outs);
-  int _handle_command(
-      const cmdmap_t &cmdmap,
-      const cref_t<MCommand> &m,
-      bufferlist *outbl,
-      std::string *outs,
-      Context **run_later,
-      bool *need_reply);
   void handle_command(const cref_t<MCommand> &m);
   void handle_mds_map(const cref_t<MMDSMap> &m);
-  void _handle_mds_map(const MDSMap &oldmap);
 
   Beacon beacon;
 
@@ -135,6 +131,7 @@ class MDSDaemon : public Dispatcher {
 
   Messenger    *messenger;
   MonClient    *monc;
+  boost::asio::io_context& ioctx;
   MgrClient     mgrc;
   std::unique_ptr<MDSMap> mdsmap;
   LogClient    log_client;
@@ -145,17 +142,8 @@ class MDSDaemon : public Dispatcher {
   // tick and other timer fun
   Context *tick_event = nullptr;
   class MDSSocketHook *asok_hook = nullptr;
+
  private:
-  struct MDSCommand {
-    MDSCommand(std::string_view signature, std::string_view help)
-        : cmdstring(signature), helpstring(help)
-    {}
-
-    std::string cmdstring;
-    std::string helpstring;
-    std::string module = "mds";
-  };
-
   bool ms_dispatch2(const ref_t<Message> &m) override;
   int ms_handle_authentication(Connection *con) override;
   void ms_handle_accept(Connection *con) override;
@@ -163,8 +151,6 @@ class MDSDaemon : public Dispatcher {
   bool ms_handle_reset(Connection *con) override;
   void ms_handle_remote_reset(Connection *con) override;
   bool ms_handle_refused(Connection *con) override;
-
-  static const std::vector<MDSCommand>& get_commands();
 
   bool parse_caps(const AuthCapsInfo&, MDSAuthCaps&);
 

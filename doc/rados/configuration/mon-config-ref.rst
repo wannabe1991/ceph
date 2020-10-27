@@ -6,8 +6,7 @@ Understanding how to configure a :term:`Ceph Monitor` is an important part of
 building a reliable :term:`Ceph Storage Cluster`. **All Ceph Storage Clusters
 have at least one monitor**. A monitor configuration usually remains fairly
 consistent, but you can add, remove or replace a monitor in a cluster. See
-`Adding/Removing a Monitor`_ and `Add/Remove a Monitor (ceph-deploy)`_ for
-details.
+`Adding/Removing a Monitor`_ for details.
 
 
 .. index:: Ceph Monitor; Paxos
@@ -15,7 +14,7 @@ details.
 Background
 ==========
 
-Ceph Monitors maintain a "master copy" of the :term:`cluster map`, which means a
+Ceph Monitors maintain a "master copy" of the :term:`Cluster Map`, which means a
 :term:`Ceph Client` can determine the location of all Ceph Monitors, Ceph OSD
 Daemons, and Ceph Metadata Servers just by connecting to one Ceph Monitor and
 retrieving a current cluster map. Before Ceph Clients can read from or write to
@@ -34,8 +33,7 @@ Monitors can query the most recent version of the cluster map during sync
 operations. Ceph Monitors leverage the key/value store's snapshots and iterators
 (using leveldb) to perform store-wide synchronization.
 
-.. ditaa:: 
-
+.. ditaa::
  /-------------\               /-------------\
  |   Monitor   | Write Changes |    Paxos    |
  |   cCCC      +-------------->+   cCCC      |
@@ -157,14 +155,14 @@ Bootstrapping Monitors
 
 In most configuration and deployment cases, tools that deploy Ceph may help
 bootstrap the Ceph Monitors by generating a monitor map for you (e.g.,
-``ceph-deploy``, etc). A Ceph Monitor requires a few explicit
+``cephadm``, etc). A Ceph Monitor requires a few explicit
 settings:
 
 - **Filesystem ID**: The ``fsid`` is the unique identifier for your
   object store. Since you can run multiple clusters on the same
   hardware, you must specify the unique ID of the object store when
   bootstrapping a monitor.  Deployment tools usually do this for you
-  (e.g., ``ceph-deploy`` can call a tool like ``uuidgen``), but you
+  (e.g., ``cephadm`` can call a tool like ``uuidgen``), but you
   may specify the ``fsid`` manually too.
   
 - **Monitor ID**: A monitor ID is a unique ID assigned to each monitor within 
@@ -174,7 +172,7 @@ settings:
   by a deployment tool, or using the ``ceph`` commandline.
 
 - **Keys**: The monitor must have secret keys. A deployment tool such as 
-  ``ceph-deploy`` usually does this for you, but you may
+  ``cephadm`` usually does this for you, but you may
   perform this step manually too. See `Monitor Keyrings`_ for details.
 
 For additional details on bootstrapping, see `Bootstrapping a Monitor`_.
@@ -420,6 +418,14 @@ by setting it in the ``[mon]`` section of the configuration file.
 :Default: ``0``
 
 
+``mon warn on pool no redundancy``
+
+:Description: Issue a ``HEALTH_WARN`` in cluster log if any pool is
+              configured with no replicas.
+:Type: Boolean
+:Default: ``True``
+
+
 ``mon cache target full warn ratio``
 
 :Description: Position between pool's ``cache_target_full`` and
@@ -497,7 +503,6 @@ Ceph Clients to read and write data. So the Ceph Storage Cluster's operating
 capacity is 95TB, not 99TB.
 
 .. ditaa::
-
  +--------+  +--------+  +--------+  +--------+  +--------+  +--------+
  | Rack 1 |  | Rack 2 |  | Rack 3 |  | Rack 4 |  | Rack 5 |  | Rack 6 |
  | cCCC   |  | cF00   |  | cCCC   |  | cCCC   |  | cCCC   |  | cCCC   |
@@ -628,7 +633,8 @@ fallen behind the other monitors. The requester asks the leader to synchronize,
 and the leader tells the requester to synchronize with a provider.
 
 
-.. ditaa:: +-----------+          +---------+          +----------+
+.. ditaa::
+           +-----------+          +---------+          +----------+
            | Requester |          | Leader  |          | Provider |
            +-----------+          +---------+          +----------+
                   |                    |                     |
@@ -1213,7 +1219,6 @@ Miscellaneous
 .. _Monitor lookup through DNS: ../mon-lookup-dns
 .. _ACID: https://en.wikipedia.org/wiki/ACID
 .. _Adding/Removing a Monitor: ../../operations/add-or-rm-mons
-.. _Add/Remove a Monitor (ceph-deploy): ../../deployment/ceph-deploy-mon
 .. _Monitoring a Cluster: ../../operations/monitoring
 .. _Monitoring OSDs and PGs: ../../operations/monitoring-osd-pg
 .. _Bootstrapping a Monitor: ../../../dev/mon-bootstrap

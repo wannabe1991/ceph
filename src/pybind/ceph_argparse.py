@@ -1022,6 +1022,7 @@ def validate(args, signature, flags=0, partial=False):
 
                 if kwarg_desc:
                     validate_one(kwarg_v, kwarg_desc)
+                    matchcnt += 1
                     store_arg(kwarg_desc, d)
                     continue
 
@@ -1123,7 +1124,7 @@ def validate_command(sigdict, args, verbose=False):
     Parse positional arguments into a parameter dict, according to
     the command descriptions.
 
-    Writes advice about nearly-matching commands ``sys.stderr`` if 
+    Writes advice about nearly-matching commands ``sys.stderr`` if
     the arguments do not match any command.
 
     :param sigdict: A command description dictionary, as returned
@@ -1316,7 +1317,9 @@ def run_in_thread(func, *args, **kwargs):
     if timeout == 0 or timeout == None:
         # python threading module will just get blocked if timeout is `None`,
         # otherwise it will keep polling until timeout or thread stops.
-        timeout = 2 ** 32
+        # wait for INT32_MAX, as python 3.6.8 use int32_t to present the
+        # timeout in integer when converting it to nanoseconds
+        timeout = (1 << (32 - 1)) - 1
     t = RadosThread(func, *args, **kwargs)
 
     # allow the main thread to exit (presumably, avoid a join() on this
@@ -1399,11 +1402,11 @@ def send_command(cluster, target=('mon', ''), cmd=None, inbuf=b'', timeout=0,
             # pgid will already be in the command for the pg <pgid>
             # form, but for tell <pgid>, we need to put it in
             if cmd:
-                cmddict = json.loads(cmd[0])
+                cmddict = json.loads(cmd)
                 cmddict['pgid'] = pgid
             else:
                 cmddict = dict(pgid=pgid)
-            cmd = [json.dumps(cmddict)]
+            cmd = json.dumps(cmddict)
             if verbose:
                 print('submit {0} for pgid {1}'.format(cmd, pgid),
                       file=sys.stderr)
@@ -1485,7 +1488,7 @@ def json_command(cluster, target=('mon', ''), prefix=None, argdict=None,
                 # use the target we were originally given
                 pass
         ret, outbuf, outs = send_command_retry(cluster,
-                                               target, [json.dumps(cmddict)],
+                                               target, json.dumps(cmddict),
                                                inbuf, timeout, verbose)
 
     except Exception as e:

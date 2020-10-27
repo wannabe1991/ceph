@@ -7,6 +7,7 @@
 #include <string>
 #include <seastar/core/future.hh>
 #include "osd/osd_types.h"
+#include "crimson/os/futurized_collection.h"
 
 namespace ceph::os {
   class Transaction;
@@ -31,7 +32,6 @@ public:
     : store{store}, coll{coll}
   {}
 
-
   auto collection() {
     return coll;
   }
@@ -46,9 +46,9 @@ public:
   seastar::future<OSDSuperblock> load_superblock();
 
   using ec_profile_t = std::map<std::string, std::string>;
-  seastar::future<pg_pool_t,
-                  std::string,
-                  ec_profile_t> load_final_pool_info(int64_t pool);
+  seastar::future<std::tuple<pg_pool_t,
+			     std::string,
+			     ec_profile_t>> load_final_pool_info(int64_t pool);
 private:
   static ghobject_t osdmap_oid(epoch_t epoch);
   static ghobject_t final_pool_info_oid(int64_t pool);

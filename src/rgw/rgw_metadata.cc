@@ -25,8 +25,6 @@
 
 #include <boost/asio/yield.hpp>
 
-using namespace rgw::sal;
-
 #define dout_subsys ceph_subsys_rgw
 
 const std::string RGWMetadataLogHistory::oid = "meta.history";
@@ -137,7 +135,7 @@ int RGWMetadataLog::store_entries_in_shard(list<cls_log_entry>& entries, int sha
 }
 
 void RGWMetadataLog::init_list_entries(int shard_id, const real_time& from_time, const real_time& end_time, 
-                                       string& marker, void **handle)
+                                       const string& marker, void **handle)
 {
   LogListCtx *ctx = new LogListCtx();
 
@@ -211,7 +209,7 @@ static void _mdlog_info_completion(librados::completion_t cb, void *arg)
 }
 
 RGWMetadataLogInfoCompletion::RGWMetadataLogInfoCompletion(info_callback_t cb)
-  : completion(librados::Rados::aio_create_completion((void *)this, nullptr,
+  : completion(librados::Rados::aio_create_completion((void *)this,
                                                       _mdlog_info_completion)),
     callback(cb)
 {

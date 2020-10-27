@@ -22,6 +22,7 @@
 #include "mgr/mgr_commands.h"
 #include "mgr/DaemonHealthMetricCollector.h"
 #include "mgr/OSDPerfMetricCollector.h"
+#include "mgr/MDSPerfMetricCollector.h"
 #include "mon/MonCommand.h"
 
 #include "messages/MMgrOpen.h"
@@ -43,7 +44,7 @@
 #define dout_subsys ceph_subsys_mgr
 #undef dout_prefix
 #define dout_prefix *_dout << "mgr.server " << __func__ << " "
-
+using namespace TOPNSPC::common;
 namespace {
   template <typename Map>
   bool map_compare(Map const &lhs, Map const &rhs) {
@@ -90,7 +91,9 @@ DaemonServer::DaemonServer(MonClient *monc_,
       shutting_down(false),
       tick_event(nullptr),
       osd_perf_metric_collector_listener(this),
-      osd_perf_metric_collector(osd_perf_metric_collector_listener)
+      osd_perf_metric_collector(osd_perf_metric_collector_listener),
+      mds_perf_metric_collector_listener(this),
+      mds_perf_metric_collector(mds_perf_metric_collector_listener)
 {
   g_conf().add_observer(this);
 }
@@ -108,7 +111,7 @@ int DaemonServer::init(uint64_t gid, entity_addrvec_t client_addrs)
   msgr = Messenger::create(g_ceph_context, public_msgr_type,
 			   entity_name_t::MGR(gid),
 			   "mgr",
-			   getpid(), 0);
+			   Messenger::get_pid_nonce());
   msgr->set_default_policy(Messenger::Policy::stateless_server(0));
 
   msgr->set_auth_client(monc);
@@ -266,6 +269,11 @@ bool DaemonServer::ms_dispatch2(const ref_t<Message>& m)
   };
 }
 
+void DaemonServer::dump_pg_ready(ceph::Formatter *f)
+{
+  f->dump_bool("pg_ready", pgmap_ready.load());
+}
+
 void DaemonServer::maybe_ready(int32_t osd_id)
 {
   if (pgmap_ready.load()) {
@@ -358,6 +366,22 @@ void DaemonServer::handle_osd_perf_metric_query_updated()
       }));
 }
 
+void DaemonServer::handle_mds_perf_metric_query_updated()
+{
+  dout(10) << dendl;
+
+  // Send a fresh MMgrConfigure to all clients, so that they can follow
+  // the new policy for transmitting stats
+  finisher.queue(new LambdaContext([this](int r) {
+        std::lock_guard l(lock);
+        for (auto &c : daemon_connections) {
+          if (c->peer_is_mds()) {
+            _send_configure(c);
+          }
+        }
+      }));
+}
+
 void DaemonServer::shutdown()
 {
   dout(10) << "begin" << dendl;
@@ -383,37 +407,79 @@ static DaemonKey key_from_service(
   }
 }
 
+void DaemonServer::fetch_missing_metadata(const DaemonKey& key,
+					  const entity_addr_t& addr)
+{
+  if (!daemon_state.is_updating(key) &&
+      (key.type == "osd" || key.type == "mds" || key.type == "mon")) {
+    std::ostringstream oss;
+    auto c = new MetadataUpdate(daemon_state, key);
+    if (key.type == "osd") {
+      oss << "{\"prefix\": \"osd metadata\", \"id\": "
+	  << key.name<< "}";
+    } else if (key.type == "mds") {
+      c->set_default("addr", stringify(addr));
+      oss << "{\"prefix\": \"mds metadata\", \"who\": \""
+	  << key.name << "\"}";
+    } else if (key.type == "mon") {
+      oss << "{\"prefix\": \"mon metadata\", \"id\": \""
+	  << key.name << "\"}";
+    } else {
+      ceph_abort();
+    }
+    monc->start_mon_command({oss.str()}, {}, &c->outbl, &c->outs, c);
+  }
+}
+
 bool DaemonServer::handle_open(const ref_t<MMgrOpen>& m)
 {
-  std::lock_guard l(lock);
+  std::unique_lock l(lock);
 
   DaemonKey key = key_from_service(m->service_name,
 				   m->get_connection()->get_peer_type(),
 				   m->daemon_name);
 
-  dout(10) << "from " << m->get_connection() << "  " << key << dendl;
+  auto con = m->get_connection();
+  dout(10) << "from " << key << " " << con->get_peer_addr() << dendl;
 
-  _send_configure(m->get_connection());
+  _send_configure(con);
 
   DaemonStatePtr daemon;
   if (daemon_state.exists(key)) {
+    dout(20) << "updating existing DaemonState for " << key << dendl;
     daemon = daemon_state.get(key);
   }
-  if (m->service_daemon && !daemon) {
-    dout(4) << "constructing new DaemonState for " << key << dendl;
-    daemon = std::make_shared<DaemonState>(daemon_state.types);
-    daemon->key = key;
-    daemon->service_daemon = true;
-    daemon_state.insert(daemon);
+  if (!daemon) {
+    if (m->service_daemon) {
+      dout(4) << "constructing new DaemonState for " << key << dendl;
+      daemon = std::make_shared<DaemonState>(daemon_state.types);
+      daemon->key = key;
+      daemon->service_daemon = true;
+      daemon_state.insert(daemon);
+    } else {
+      /* A normal Ceph daemon has connected but we are or should be waiting on
+       * metadata for it. Close the session so that it tries to reconnect.
+       */
+      dout(2) << "ignoring open from " << key << " " << con->get_peer_addr()
+              << "; not ready for session (expect reconnect)" << dendl;
+      con->mark_down();
+      l.unlock();
+      fetch_missing_metadata(key, m->get_source_addr());
+      return true;
+    }
   }
   if (daemon) {
-    dout(20) << "updating existing DaemonState for " << m->daemon_name << dendl;
+    if (m->service_daemon) {
+      // update the metadata through the daemon state index to
+      // ensure it's kept up-to-date
+      daemon_state.update_metadata(daemon, m->daemon_metadata);
+    }
+
     std::lock_guard l(daemon->lock);
     daemon->perf_counters.clear();
 
     daemon->service_daemon = m->service_daemon;
     if (m->service_daemon) {
-      daemon->set_metadata(m->daemon_metadata);
       daemon->service_status = m->daemon_status;
 
       utime_t now = ceph_clock_now();
@@ -443,13 +509,13 @@ bool DaemonServer::handle_open(const ref_t<MMgrOpen>& m)
 	     << " bytes" << dendl;
   }
 
-  if (m->get_connection()->get_peer_type() != entity_name_t::TYPE_CLIENT &&
+  if (con->get_peer_type() != entity_name_t::TYPE_CLIENT &&
       m->service_name.empty())
   {
     // Store in set of the daemon/service connections, i.e. those
     // connections that require an update in the event of stats
     // configuration changes.
-    daemon_connections.insert(m->get_connection());
+    daemon_connections.insert(con);
   }
 
   return true;
@@ -481,6 +547,20 @@ bool DaemonServer::handle_close(const ref_t<MMgrClose>& m)
   return true;
 }
 
+void DaemonServer::update_task_status(
+  DaemonKey key,
+  const std::map<std::string,std::string>& task_status)
+{
+  dout(10) << "got task status from " << key << dendl;
+
+  [[maybe_unused]] auto [daemon, added] =
+    pending_service_map.get_daemon(key.type, key.name);
+  if (daemon->task_status != task_status) {
+    daemon->task_status = task_status;
+    pending_service_map_dirty = pending_service_map.epoch;
+  }
+}
+
 bool DaemonServer::handle_report(const ref_t<MMgrReport>& m)
 {
   DaemonKey key;
@@ -498,7 +578,9 @@ bool DaemonServer::handle_report(const ref_t<MMgrReport>& m)
     // Clients should not be sending us stats unless they are declaring
     // themselves to be a daemon for some service.
     dout(10) << "rejecting report from non-daemon client " << m->daemon_name
-	    << dendl;
+	     << dendl;
+    clog->warn() << "rejecting report from non-daemon client " << m->daemon_name
+		 << " at " << m->get_connection()->get_peer_addrs();
     m->get_connection()->mark_down();
     return true;
   }
@@ -519,29 +601,7 @@ bool DaemonServer::handle_report(const ref_t<MMgrReport>& m)
       dout(5) << "rejecting report from " << key << ", since we do not have its metadata now."
               << dendl;
       // issue metadata request in background
-      if (!daemon_state.is_updating(key) && 
-          (key.type == "osd" || key.type == "mds" || key.type == "mon")) {
-
-        std::ostringstream oss;
-        auto c = new MetadataUpdate(daemon_state, key);
-        if (key.type == "osd") {
-          oss << "{\"prefix\": \"osd metadata\", \"id\": "
-              << key.name<< "}";
-
-        } else if (key.type == "mds") {
-          c->set_default("addr", stringify(m->get_source_addr()));
-          oss << "{\"prefix\": \"mds metadata\", \"who\": \""
-              << key.name << "\"}";
- 
-        } else if (key.type == "mon") {
-          oss << "{\"prefix\": \"mon metadata\", \"id\": \""
-              << key.name << "\"}";
-        } else {
-          ceph_abort();
-        }
-
-        monc->start_mon_command({oss.str()}, {}, &c->outbl, &c->outs, c);
-      }
+      fetch_missing_metadata(key, m->get_source_addr());
 
       locker.lock();
 
@@ -583,24 +643,20 @@ bool DaemonServer::handle_report(const ref_t<MMgrReport>& m)
                  << " ignored " << daemon->ignored_mon_config << dendl;
       }
 
+      utime_t now = ceph_clock_now();
       if (daemon->service_daemon) {
-        utime_t now = ceph_clock_now();
         if (m->daemon_status) {
           daemon->service_status_stamp = now;
           daemon->service_status = *m->daemon_status;
         }
-        if (m->task_status && !map_compare(daemon->task_status, *m->task_status)) {
-          auto [d, added] = pending_service_map.get_daemon(m->service_name,
-							   m->daemon_name);
-	  if (!added) {
-            daemon->task_status = *m->task_status;
-            d->task_status = *m->task_status;
-            pending_service_map_dirty = pending_service_map.epoch;
-	  }
-        }
         daemon->last_service_beacon = now;
       } else if (m->daemon_status) {
         derr << "got status from non-daemon " << key << dendl;
+      }
+      // update task status
+      if (m->task_status) {
+        update_task_status(key, *m->task_status);
+        daemon->last_service_beacon = now;
       }
       if (m->get_connection()->peer_is_osd() || m->get_connection()->peer_is_mon()) {
         // only OSD and MON send health_checks to me now
@@ -620,6 +676,11 @@ bool DaemonServer::handle_report(const ref_t<MMgrReport>& m)
     osd_perf_metric_collector.process_reports(m->osd_perf_metric_reports);
   }
 
+  if (m->metric_report_message) {
+    const MetricReportMessage &message = *m->metric_report_message;
+    boost::apply_visitor(HandlePayloadVisitor(this), message.payload);
+  }
+
   return true;
 }
 
@@ -634,7 +695,7 @@ void DaemonServer::_generate_command_map(
       continue;
     if (p->first == "caps") {
       vector<string> cv;
-      if (cmd_getval(g_ceph_context, cmdmap, "caps", cv) &&
+      if (cmd_getval(cmdmap, "caps", cv) &&
 	  cv.size() % 2 == 0) {
 	for (unsigned i = 0; i < cv.size(); i += 2) {
 	  string k = string("caps_") + cv[i];
@@ -773,20 +834,12 @@ public:
 bool DaemonServer::handle_command(const ref_t<MCommand>& m)
 {
   std::lock_guard l(lock);
-  // a blank fsid in MCommand signals a legacy client sending a "mon-mgr" CLI
-  // command.
-  if (m->fsid != uuid_d()) {
-    cct->get_admin_socket()->queue_tell_command(m);
+  auto cmdctx = std::make_shared<CommandContext>(m);
+  try {
+    return _handle_command(cmdctx);
+  } catch (const bad_cmd_get& e) {
+    cmdctx->reply(-EINVAL, e.what());
     return true;
-  } else {
-    // legacy client; send to CLI processing
-    auto cmdctx = std::make_shared<CommandContext>(m);
-    try {
-      return _handle_command(cmdctx);
-    } catch (const bad_cmd_get& e) {
-      cmdctx->reply(-EINVAL, e.what());
-      return true;
-    }
   }
 }
 
@@ -818,8 +871,12 @@ bool DaemonServer::_handle_command(
   std::shared_ptr<CommandContext>& cmdctx)
 {
   MessageRef m;
+  bool admin_socket_cmd = false;
   if (cmdctx->m_tell) {
     m = cmdctx->m_tell;
+    // a blank fsid in MCommand signals a legacy client sending a "mon-mgr" CLI
+    // command.
+    admin_socket_cmd = (cmdctx->m_tell->fsid != uuid_d());
   } else {
     m = cmdctx->m_mgr;
   }
@@ -844,16 +901,19 @@ bool DaemonServer::_handle_command(
   }
 
   {
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "format", format, string("plain"));
+    cmd_getval(cmdctx->cmdmap, "format", format, string("plain"));
     f.reset(Formatter::create(format));
   }
 
   string prefix;
-  cmd_getval(cct, cmdctx->cmdmap, "prefix", prefix);
+  cmd_getval(cmdctx->cmdmap, "prefix", prefix);
 
   dout(10) << "decoded-size=" << cmdctx->cmdmap.size() << " prefix=" << prefix  << dendl;
 
-  if (prefix == "get_command_descriptions") {
+  // this is just for mgr commands - admin socket commands will fall
+  // through and use the admin socket version of
+  // get_command_descriptions
+  if (prefix == "get_command_descriptions" && !admin_socket_cmd) {
     dout(10) << "reading commands from python modules" << dendl;
     const auto py_commands = py_modules.get_commands();
 
@@ -890,7 +950,10 @@ bool DaemonServer::_handle_command(
 
   bool is_allowed = false;
   ModuleCommand py_command;
-  if (!mgr_cmd) {
+  if (admin_socket_cmd) {
+    // admin socket commands require all capabilities
+    is_allowed = session->caps.is_allow_all();
+  } else if (!mgr_cmd) {
     // Resolve the command to the name of the module that will
     // handle it (if the command exists)
     auto py_commands = py_modules.get_py_commands();
@@ -923,6 +986,11 @@ bool DaemonServer::_handle_command(
     << "entity='" << session->entity_name << "' "
     << "cmd=" << cmdctx->cmd << ": dispatch";
 
+  if (admin_socket_cmd) {
+    cct->get_admin_socket()->queue_tell_command(cmdctx->m_tell);
+    return true;
+  }
+
   // ----------------
   // service map commands
   if (prefix == "service dump") {
@@ -941,6 +1009,10 @@ bool DaemonServer::_handle_command(
     // only include state from services that are in the persisted service map
     f->open_object_section("service_status");
     for (auto& [type, service] : pending_service_map.services) {
+      if (ServiceMap::is_normal_ceph_entity(type)) {
+        continue;
+      }
+
       f->open_object_section(type.c_str());
       for (auto& q : service.daemons) {
 	f->open_object_section(q.first.c_str());
@@ -968,8 +1040,8 @@ bool DaemonServer::_handle_command(
   if (prefix == "config set") {
     std::string key;
     std::string val;
-    cmd_getval(cct, cmdctx->cmdmap, "key", key);
-    cmd_getval(cct, cmdctx->cmdmap, "value", val);
+    cmd_getval(cmdctx->cmdmap, "key", key);
+    cmd_getval(cmdctx->cmdmap, "value", val);
     r = cct->_conf.set_val(key, val, &ss);
     if (r == 0) {
       cct->_conf.apply_changes(nullptr);
@@ -988,7 +1060,7 @@ bool DaemonServer::_handle_command(
     pg_t pgid;
     spg_t spgid;
     string pgidstr;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "pgid", pgidstr);
+    cmd_getval(cmdctx->cmdmap, "pgid", pgidstr);
     if (!pgid.parse(pgidstr.c_str())) {
       ss << "invalid pgid '" << pgidstr << "'";
       cmdctx->reply(-EINVAL, ss);
@@ -1045,7 +1117,7 @@ bool DaemonServer::_handle_command(
 	      prefix == "osd deep-scrub" ||
 	      prefix == "osd repair") {
     string whostr;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "who", whostr);
+    cmd_getval(cmdctx->cmdmap, "who", whostr);
     vector<string> pvec;
     get_str_vec(prefix, pvec);
 
@@ -1130,7 +1202,7 @@ bool DaemonServer::_handle_command(
              prefix == "osd pool deep-scrub" ||
              prefix == "osd pool repair") {
     vector<string> pool_names;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "who", pool_names);
+    cmd_getval(cmdctx->cmdmap, "who", pool_names);
     if (pool_names.empty()) {
       ss << "must specify one or more pool names";
       cmdctx->reply(-EINVAL, ss);
@@ -1203,10 +1275,10 @@ bool DaemonServer::_handle_command(
       prefix == "osd test-reweight-by-pg" ||
       prefix == "osd test-reweight-by-utilization";
     int64_t oload;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "oload", oload, int64_t(120));
+    cmd_getval(cmdctx->cmdmap, "oload", oload, int64_t(120));
     set<int64_t> pools;
     vector<string> poolnames;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "pools", poolnames);
+    cmd_getval(cmdctx->cmdmap, "pools", poolnames);
     cluster_state.with_osdmap([&](const OSDMap& osdmap) {
 	for (const auto& poolname : poolnames) {
 	  int64_t pool = osdmap.lookup_pg_pool_name(poolname);
@@ -1223,21 +1295,21 @@ bool DaemonServer::_handle_command(
     }
     
     double max_change = g_conf().get_val<double>("mon_reweight_max_change");
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "max_change", max_change);
+    cmd_getval(cmdctx->cmdmap, "max_change", max_change);
     if (max_change <= 0.0) {
       ss << "max_change " << max_change << " must be positive";
       cmdctx->reply(-EINVAL, ss);
       return true;
     }
     int64_t max_osds = g_conf().get_val<int64_t>("mon_reweight_max_osds");
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "max_osds", max_osds);
+    cmd_getval(cmdctx->cmdmap, "max_osds", max_osds);
     if (max_osds <= 0) {
       ss << "max_osds " << max_osds << " must be positive";
       cmdctx->reply(-EINVAL, ss);
       return true;
     }
     bool no_increasing = false;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "no_increasing", no_increasing);
+    cmd_getval(cmdctx->cmdmap, "no_increasing", no_increasing);
     string out_str;
     mempool::osdmap::map<int32_t, uint32_t> new_weights;
     r = cluster_state.with_osdmap_and_pgmap([&](const OSDMap &osdmap, const PGMap& pgmap) {
@@ -1288,8 +1360,8 @@ bool DaemonServer::_handle_command(
     }
   } else if (prefix == "osd df") {
     string method, filter;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "output_method", method);
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "filter", filter);
+    cmd_getval(cmdctx->cmdmap, "output_method", method);
+    cmd_getval(cmdctx->cmdmap, "filter", filter);
     stringstream rs;
     r = cluster_state.with_osdmap_and_pgmap([&](const OSDMap& osdmap, const PGMap& pgmap) {
         // sanity check filter(s)
@@ -1309,7 +1381,7 @@ bool DaemonServer::_handle_command(
     return true;
   } else if (prefix == "osd pool stats") {
     string pool_name;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "pool_name", pool_name);
+    cmd_getval(cmdctx->cmdmap, "pool_name", pool_name);
     int64_t poolid = -ENOENT;
     bool one_pool = false;
     r = cluster_state.with_osdmap_and_pgmap([&](const OSDMap& osdmap, const PGMap& pg_map) {
@@ -1360,7 +1432,7 @@ bool DaemonServer::_handle_command(
     int r = 0;
     if (prefix == "osd safe-to-destroy") {
       vector<string> ids;
-      cmd_getval(g_ceph_context, cmdctx->cmdmap, "ids", ids);
+      cmd_getval(cmdctx->cmdmap, "ids", ids);
       cluster_state.with_osdmap([&](const OSDMap& osdmap) {
 				  r = osdmap.parse_osd_id_list(ids, &osds, &ss);
 				});
@@ -1370,7 +1442,7 @@ bool DaemonServer::_handle_command(
       }
     } else {
       int64_t id;
-      if (!cmd_getval(g_ceph_context, cmdctx->cmdmap, "id", id)) {
+      if (!cmd_getval(cmdctx->cmdmap, "id", id)) {
 	r = -EINVAL;
 	ss << "must specify OSD id";
       } else {
@@ -1402,33 +1474,6 @@ bool DaemonServer::_handle_command(
 	    safe_to_destroy.insert(osd);
 	    continue;  // clearly safe to destroy
 	  }
-          set<int64_t> pools;
-          osdmap.get_pool_ids_by_osd(g_ceph_context, osd, &pools);
-          if (pools.empty()) {
-            // osd does not belong to any pools yet
-            safe_to_destroy.insert(osd);
-            continue;
-          }
-          if (osdmap.is_down(osd) && osdmap.is_out(osd)) {
-            // if osd is down&out and all relevant pools are active+clean,
-            // then should be safe to destroy
-            bool all_osd_pools_active_clean = true;
-            for (auto &ps: pg_map.pg_stat) {
-              auto& pg = ps.first;
-              auto state = ps.second.state;
-              if (!pools.count(pg.pool()))
-                continue;
-              if ((state & (PG_STATE_ACTIVE | PG_STATE_CLEAN)) !=
-                           (PG_STATE_ACTIVE | PG_STATE_CLEAN)) {
-                all_osd_pools_active_clean = false;
-                break;
-              }
-            }
-            if (all_osd_pools_active_clean) {
-              safe_to_destroy.insert(osd);
-              continue;
-            }
-          }
 	  auto q = pg_map.num_pg_by_osd.find(osd);
 	  if (q != pg_map.num_pg_by_osd.end()) {
 	    if (q->second.acting > 0 || q->second.up_not_acting > 0) {
@@ -1516,10 +1561,10 @@ bool DaemonServer::_handle_command(
 
     if (r) {
       bool force = false;
-      cmd_getval(cct, cmdctx->cmdmap, "force", force);
+      cmd_getval(cmdctx->cmdmap, "force", force);
       if (!force) {
         // Backward compat
-        cmd_getval(cct, cmdctx->cmdmap, "yes_i_really_mean_it", force);
+        cmd_getval(cmdctx->cmdmap, "yes_i_really_mean_it", force);
       }
       if (!force) {
         ss << "\nYou can proceed by passing --force, but be warned that"
@@ -1543,7 +1588,7 @@ bool DaemonServer::_handle_command(
     return true;
   } else if (prefix == "osd ok-to-stop") {
     vector<string> ids;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "ids", ids);
+    cmd_getval(cmdctx->cmdmap, "ids", ids);
     set<int> osds;
     int r;
     cluster_state.with_osdmap([&](const OSDMap& osdmap) {
@@ -1575,7 +1620,9 @@ bool DaemonServer::_handle_command(
 		found = true;
 		continue;
 	      }
-	      pg_acting.insert(anm.osd);
+	      if (anm.osd != CRUSH_ITEM_NONE) {
+		pg_acting.insert(anm.osd);
+	      }
 	    }
 	  } else {
 	    for (auto& a : q.second.acting) {
@@ -1583,7 +1630,9 @@ bool DaemonServer::_handle_command(
 		found = true;
 		continue;
 	      }
-	      pg_acting.insert(a);
+	      if (a != CRUSH_ITEM_NONE) {
+		pg_acting.insert(a);
+	      }
 	    }
 	  }
 	  if (!found) {
@@ -1652,7 +1701,7 @@ bool DaemonServer::_handle_command(
     if (granularity == "pg") {
       // covnert pg names to pgs, discard any invalid ones while at it
       vector<string> pgids;
-      cmd_getval(g_ceph_context, cmdctx->cmdmap, "pgid", pgids);
+      cmd_getval(cmdctx->cmdmap, "pgid", pgids);
       for (auto& i : pgids) {
         pg_t pgid;
         if (!pgid.parse(i.c_str())) {
@@ -1665,7 +1714,7 @@ bool DaemonServer::_handle_command(
     } else {
       // per pool
       vector<string> pool_names;
-      cmd_getval(g_ceph_context, cmdctx->cmdmap, "who", pool_names);
+      cmd_getval(cmdctx->cmdmap, "who", pool_names);
       if (pool_names.empty()) {
         ss << "must specify one or more pool names";
         cmdctx->reply(-EINVAL, ss);
@@ -1790,7 +1839,7 @@ bool DaemonServer::_handle_command(
   } else if (prefix == "config show" ||
 	     prefix == "config show-with-defaults") {
     string who;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "who", who);
+    cmd_getval(cmdctx->cmdmap, "who", who);
     auto [key, valid] = DaemonKey::parse(who);
     if (!valid) {
       ss << "invalid daemon name: use <type>.<id>";
@@ -1808,7 +1857,13 @@ bool DaemonServer::_handle_command(
 
     int r = 0;
     string name;
-    if (cmd_getval(g_ceph_context, cmdctx->cmdmap, "key", name)) {
+    if (cmd_getval(cmdctx->cmdmap, "key", name)) {
+      // handle special options
+      if (name == "fsid") {
+       cmdctx->odata.append(stringify(monc->get_fsid()) + "\n");
+       cmdctx->reply(r, ss);
+       return true;
+      }
       auto p = daemon->config.find(name);
       if (p != daemon->config.end() &&
 	  !p->second.empty()) {
@@ -1985,11 +2040,11 @@ bool DaemonServer::_handle_command(
       auto now = ceph_clock_now();
       daemon_state.with_devices([&tbl, now](const DeviceState& dev) {
 	  string h;
-	  for (auto& i : dev.devnames) {
+	  for (auto& i : dev.attachments) {
 	    if (h.size()) {
 	      h += " ";
 	    }
-	    h += i.first + ":" + i.second;
+	    h += std::get<0>(i) + ":" + std::get<1>(i);
 	  }
 	  string d;
 	  for (auto& i : dev.daemons) {
@@ -2010,7 +2065,7 @@ bool DaemonServer::_handle_command(
     return true;
   } else if (prefix == "device ls-by-daemon") {
     string who;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "who", who);
+    cmd_getval(cmdctx->cmdmap, "who", who);
     if (auto [k, valid] = DaemonKey::parse(who); !valid) {
       ss << who << " is not a valid daemon name";
       r = -EINVAL;
@@ -2037,11 +2092,11 @@ bool DaemonServer::_handle_command(
 	    daemon_state.with_device(
 	      i.first, [&tbl, now] (const DeviceState& dev) {
 		string h;
-		for (auto& i : dev.devnames) {
+		for (auto& i : dev.attachments) {
 		  if (h.size()) {
 		    h += " ";
 		  }
-		  h += i.first + ":" + i.second;
+		  h += std::get<0>(i) + ":" + std::get<1>(i);
 		}
 		tbl << dev.devid
 		    << h
@@ -2059,7 +2114,7 @@ bool DaemonServer::_handle_command(
     }
   } else if (prefix == "device ls-by-host") {
     string host;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "host", host);
+    cmd_getval(cmdctx->cmdmap, "host", host);
     set<string> devids;
     daemon_state.list_devids_by_server(host, &devids);
     if (f) {
@@ -2083,12 +2138,12 @@ bool DaemonServer::_handle_command(
 	daemon_state.with_device(
 	  devid, [&tbl, &host, now] (const DeviceState& dev) {
 	    string n;
-	    for (auto& j : dev.devnames) {
-	      if (j.first == host) {
+	    for (auto& j : dev.attachments) {
+	      if (std::get<0>(j) == host) {
 		if (n.size()) {
 		  n += " ";
 		}
-		n += j.second;
+		n += std::get<1>(j);
 	      }
 	    }
 	    string d;
@@ -2111,7 +2166,7 @@ bool DaemonServer::_handle_command(
     return true;
   } else if (prefix == "device info") {
     string devid;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "devid", devid);
+    cmd_getval(cmdctx->cmdmap, "devid", devid);
     int r = 0;
     ostringstream rs;
     if (!daemon_state.with_device(devid,
@@ -2135,10 +2190,10 @@ bool DaemonServer::_handle_command(
     return true;
   } else if (prefix == "device set-life-expectancy") {
     string devid;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "devid", devid);
+    cmd_getval(cmdctx->cmdmap, "devid", devid);
     string from_str, to_str;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "from", from_str);
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "to", to_str);
+    cmd_getval(cmdctx->cmdmap, "from", from_str);
+    cmd_getval(cmdctx->cmdmap, "to", to_str);
     utime_t from, to;
     if (!from.parse(from_str)) {
       ss << "unable to parse datetime '" << from_str << "'";
@@ -2173,7 +2228,7 @@ bool DaemonServer::_handle_command(
     return true;
   } else if (prefix == "device rm-life-expectancy") {
     string devid;
-    cmd_getval(g_ceph_context, cmdctx->cmdmap, "devid", devid);
+    cmd_getval(cmdctx->cmdmap, "devid", devid);
     map<string,string> meta;
     if (daemon_state.with_device_write(devid, [&meta] (DeviceState& dev) {
 	  dev.rm_life_expectancy();
@@ -2314,10 +2369,19 @@ void DaemonServer::_prune_pending_service_map()
     while (q != p->second.daemons.end()) {
       DaemonKey key{p->first, q->first};
       if (!daemon_state.exists(key)) {
-	derr << "missing key " << key << dendl;
-	++q;
-	continue;
+        if (ServiceMap::is_normal_ceph_entity(p->first)) {
+          dout(10) << "daemon " << key << " in service map but not in daemon state "
+                   << "index -- force pruning" << dendl;
+          q = p->second.daemons.erase(q);
+          pending_service_map_dirty = pending_service_map.epoch;
+        } else {
+          derr << "missing key " << key << dendl;
+          ++q;
+        }
+
+        continue;
       }
+
       auto daemon = daemon_state.get(key);
       std::lock_guard l(daemon->lock);
       if (daemon->last_service_beacon == utime_t()) {
@@ -2512,6 +2576,7 @@ void DaemonServer::adjust_pgs()
 		       << dendl;
 	      ok = false;
 	    }
+	    vector<int32_t> source_acting;
             for (auto &merge_participant : {merge_source, merge_target}) {
               bool is_merge_source = merge_participant == merge_source;
               if (osdmap.have_pg_upmaps(merge_participant)) {
@@ -2543,6 +2608,19 @@ void DaemonServer::adjust_pgs()
 		         << " not clean (" << pg_state_string(q->second.state)
 		         << ")" << dendl;
 	        ok = false;
+	      }
+	      if (is_merge_source) {
+		source_acting = q->second.acting;
+	      } else if (ok && q->second.acting != source_acting) {
+		dout(10) << "pool " << i.first
+		         << " pg_num_target " << p.get_pg_num_target()
+		         << " pg_num " << p.get_pg_num()
+		         << (is_merge_source ? " - merge source " : " - merge target ")
+                         << merge_participant
+			 << " acting does not match (source " << source_acting
+			 << " != target " << q->second.acting
+			 << ")" << dendl;
+		ok = false;
 	      }
             }
 
@@ -2730,16 +2808,24 @@ void DaemonServer::got_service_map()
 	// we just started up
 	dout(10) << "got initial map e" << service_map.epoch << dendl;
 	pending_service_map = service_map;
+	pending_service_map.epoch = service_map.epoch + 1;
       } else {
 	// we we already active and therefore must have persisted it,
 	// which means ours is the same or newer.
 	dout(10) << "got updated map e" << service_map.epoch << dendl;
+	ceph_assert(pending_service_map.epoch > service_map.epoch);
       }
-      pending_service_map.epoch = service_map.epoch + 1;
     });
 
   // cull missing daemons, populate new ones
+  std::set<std::string> types;
   for (auto& [type, service] : pending_service_map.services) {
+    if (ServiceMap::is_normal_ceph_entity(type)) {
+      continue;
+    }
+
+    types.insert(type);
+
     std::set<std::string> names;
     for (auto& q : service.daemons) {
       names.insert(q.first);
@@ -2755,6 +2841,7 @@ void DaemonServer::got_service_map()
     }
     daemon_state.cull(type, names);
   }
+  daemon_state.cull_services(types);
 }
 
 void DaemonServer::got_mgr_map()
@@ -2830,26 +2917,44 @@ void DaemonServer::_send_configure(ConnectionRef c)
   if (c->peer_is_osd()) {
     configure->osd_perf_metric_queries =
         osd_perf_metric_collector.get_queries();
+  } else if (c->peer_is_mds()) {
+    configure->metric_config_message =
+      MetricConfigMessage(MDSConfigPayload(mds_perf_metric_collector.get_queries()));
   }
 
   c->send_message2(configure);
 }
 
-OSDPerfMetricQueryID DaemonServer::add_osd_perf_query(
+MetricQueryID DaemonServer::add_osd_perf_query(
     const OSDPerfMetricQuery &query,
     const std::optional<OSDPerfMetricLimit> &limit)
 {
   return osd_perf_metric_collector.add_query(query, limit);
 }
 
-int DaemonServer::remove_osd_perf_query(OSDPerfMetricQueryID query_id)
+int DaemonServer::remove_osd_perf_query(MetricQueryID query_id)
 {
   return osd_perf_metric_collector.remove_query(query_id);
 }
 
-int DaemonServer::get_osd_perf_counters(
-    OSDPerfMetricQueryID query_id,
-    std::map<OSDPerfMetricKey, PerformanceCounters> *counters)
+int DaemonServer::get_osd_perf_counters(OSDPerfCollector *collector)
 {
-  return osd_perf_metric_collector.get_counters(query_id, counters);
+  return osd_perf_metric_collector.get_counters(collector);
+}
+
+MetricQueryID DaemonServer::add_mds_perf_query(
+    const MDSPerfMetricQuery &query,
+    const std::optional<MDSPerfMetricLimit> &limit)
+{
+  return mds_perf_metric_collector.add_query(query, limit);
+}
+
+int DaemonServer::remove_mds_perf_query(MetricQueryID query_id)
+{
+  return mds_perf_metric_collector.remove_query(query_id);
+}
+
+int DaemonServer::get_mds_perf_counters(MDSPerfCollector *collector)
+{
+  return mds_perf_metric_collector.get_counters(collector);
 }

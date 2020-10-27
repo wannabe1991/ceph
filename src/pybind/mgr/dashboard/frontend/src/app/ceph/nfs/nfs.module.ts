@@ -3,9 +3,7 @@ import { NgModule } from '@angular/core';
 import { ReactiveFormsModule } from '@angular/forms';
 import { RouterModule } from '@angular/router';
 
-import { NgBootstrapFormValidationModule } from 'ng-bootstrap-form-validation';
-import { TabsModule } from 'ngx-bootstrap/tabs';
-import { TypeaheadModule } from 'ngx-bootstrap/typeahead';
+import { NgbNavModule, NgbTooltipModule, NgbTypeaheadModule } from '@ng-bootstrap/ng-bootstrap';
 
 import { SharedModule } from '../../shared/shared.module';
 import { Nfs501Component } from './nfs-501/nfs-501.component';
@@ -19,10 +17,10 @@ import { NfsListComponent } from './nfs-list/nfs-list.component';
     ReactiveFormsModule,
     RouterModule,
     SharedModule,
-    TabsModule.forRoot(),
+    NgbNavModule,
     CommonModule,
-    TypeaheadModule.forRoot(),
-    NgBootstrapFormValidationModule
+    NgbTypeaheadModule,
+    NgbTooltipModule
   ],
   declarations: [
     NfsListComponent,

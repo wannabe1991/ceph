@@ -29,7 +29,7 @@ minimal settings for each instance of monitor daemons. For example:
    the command line to retrieve the name of the node. Do not use ``host``
    settings for anything other than initial monitors unless you are deploying
    Ceph manually. You **MUST NOT** specify ``host`` under individual daemons
-   when using deployment tools like ``chef`` or ``ceph-deploy``, as those tools
+   when using deployment tools like ``chef`` or ``cephadm``, as those tools
    will enter the appropriate values for you in the cluster map.
 
 
@@ -61,7 +61,7 @@ following path::
 
 	/var/lib/ceph/mon/$cluster-$id
 
-You or a deployment tool (e.g., ``ceph-deploy``) must create the corresponding
+You or a deployment tool (e.g., ``cephadm``) must create the corresponding
 directory. With metavariables fully  expressed and a cluster named "ceph", the
 foregoing directory would evaluate to::
 
@@ -81,17 +81,15 @@ Authentication
 .. versionadded:: Bobtail 0.56
 
 For Bobtail (v 0.56) and beyond, you should expressly enable or disable
-authentication in the ``[global]`` section of your Ceph configuration file. ::
+authentication in the ``[global]`` section of your Ceph configuration file.
+
+.. code-block:: ini
 
 	auth cluster required = cephx
 	auth service required = cephx
 	auth client required = cephx
 
 Additionally, you should enable message signing. See `Cephx Config Reference`_ for details.
-
-.. important:: When upgrading, we recommend expressly disabling authentication
-   first, then perform the upgrade. Once the upgrade is complete, re-enable
-   authentication.
 
 .. _Cephx Config Reference: ../auth-config-ref
 
@@ -120,7 +118,7 @@ following path::
 
 	/var/lib/ceph/osd/$cluster-$id
 
-You or a deployment tool (e.g., ``ceph-deploy``) must create the corresponding
+You or a deployment tool (e.g., ``cephadm``) must create the corresponding
 directory. With metavariables fully  expressed and a cluster named "ceph", the
 foregoing directory would evaluate to::
 
@@ -129,7 +127,7 @@ foregoing directory would evaluate to::
 You may override this path using the ``osd data`` setting. We don't recommend
 changing the default location. Create the default directory on your OSD host.
 
-::
+.. prompt:: bash $
 
 	ssh {osd-host}
 	sudo mkdir /var/lib/ceph/osd/ceph-{osd-number}
@@ -138,6 +136,8 @@ The ``osd data`` path ideally leads to a mount point with a hard disk that is
 separate from the hard disk storing and running the operating system and
 daemons. If the OSD is for a disk other than the OS disk, prepare it for
 use with Ceph, and mount it to the directory you just created::
+
+.. prompt:: bash $
 
 	ssh {new-osd-host}
 	sudo mkfs -t {fstype} /dev/{disk}
@@ -183,73 +183,16 @@ Example ceph.conf
 
 
 
-Running Multiple Clusters
-=========================
+Running Multiple Clusters (DEPRECATED)
+======================================
 
-With Ceph, you can run multiple Ceph Storage Clusters on the same hardware.
-Running multiple clusters provides a higher level of isolation compared to
-using different pools on the same cluster with different CRUSH rules. A
-separate cluster will have separate monitor, OSD and metadata server processes.
-When running Ceph with default settings, the default cluster name is ``ceph``,
-which means you would save your Ceph configuration file with the file name
-``ceph.conf`` in the ``/etc/ceph`` default directory.
+Some Ceph CLI commands take a ``-c`` (cluster name) option. This option is
+present purely for backward compatibility. You should not attempt to deploy
+or run multiple clusters on the same hardware, and it is recommended to always
+leave the cluster name as the default ("ceph").
 
-See `Create a Cluster`_ for details.
-
-.. _Create a Cluster: ../../deployment/ceph-deploy-new
-
-When you run multiple clusters, you must name your cluster and save the Ceph
-configuration file with the name of the cluster. For example, a cluster named
-``openstack`` will have a Ceph configuration file with the file name
-``openstack.conf`` in the  ``/etc/ceph`` default directory.
-
-.. important:: Cluster names must consist of letters a-z and digits 0-9 only.
-
-Separate clusters imply separate data disks and journals, which are not shared
-between clusters. Referring to `Metavariables`_, the ``$cluster``  metavariable
-evaluates to the cluster name (i.e., ``openstack`` in the  foregoing example).
-Various settings use the ``$cluster`` metavariable, including:
-
-.. _Metavariables: ../ceph-conf#Metavariables
-
-- ``keyring``
-- ``admin socket``
-- ``log file``
-- ``pid file``
-- ``mon data``
-- ``mon cluster log file``
-- ``osd data``
-- ``osd journal``
-- ``mds data``
-- ``rgw data``
-
-See `General Settings`_, `OSD Settings`_, `Monitor Settings`_, `MDS Settings`_,
-`RGW Settings`_ and `Log Settings`_ for relevant path defaults that use the
-``$cluster`` metavariable.
-
-.. _General Settings: ../general-config-ref
-.. _OSD Settings: ../osd-config-ref
-.. _Monitor Settings: ../mon-config-ref
-.. _MDS Settings: ../../../cephfs/mds-config-ref
-.. _RGW Settings: ../../../radosgw/config-ref/
-.. _Log Settings: ../../troubleshooting/log-and-debug
-
-
-When creating default directories or files, you should use the cluster
-name at the appropriate places in the path. For example::
-
-	sudo mkdir /var/lib/ceph/osd/openstack-0
-	sudo mkdir /var/lib/ceph/mon/openstack-a
-
-.. important:: When running monitors on the same host, you should use
-   different ports. By default, monitors use port 6789. If you already
-   have monitors using port 6789, use a different port for your other cluster(s).
-
-To invoke a cluster other than the default ``ceph`` cluster, use the
-``-c {filename}.conf`` option with the ``ceph`` command. For example::
-
-	ceph -c {cluster-name}.conf health
-	ceph -c openstack.conf health
+If you need to allow multiple clusters to exist on the same host, please use
+:ref:`cephadm`, which uses containers to fully isolate each cluster.
 
 
 .. _Hardware Recommendations: ../../../start/hardware-recommendations

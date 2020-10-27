@@ -7,13 +7,20 @@ add_library(common_texttable_obj OBJECT
 add_library(common_prioritycache_obj OBJECT
   PriorityCache.cc)
 
+if(WIN32)
+  add_library(dlfcn_win32 STATIC dlfcn_win32.cc)
+endif()
+
 set(common_srcs
   AsyncOpTracker.cc
   BackTrace.cc
   ConfUtils.cc
   Cycles.cc
+  CDC.cc
   DecayCounter.cc
+  FastCDC.cc
   Finisher.cc
+  FixedCDC.cc
   Formatter.cc
   Graylog.cc
   HTMLFormatter.cc
@@ -26,19 +33,16 @@ set(common_srcs
   Readahead.cc
   RefCountedObj.cc
   SloppyCRCMap.cc
-  SubProcess.cc
   Thread.cc
   Throttle.cc
   Timer.cc
   TracepointProvider.cc
   TrackedOp.cc
   WorkQueue.cc
-  address_helper.cc
   admin_socket.cc
   admin_socket_client.cc
   assert.cc
   bit_str.cc
-  blkdev.cc
   bloom_filter.cc
   ceph_argparse.cc
   ceph_context.cc
@@ -57,7 +61,6 @@ set(common_srcs
   condition_variable_debug.cc
   config.cc
   config_values.cc
-  dns_resolve.cc
   dout.cc
   entity_name.cc
   environment.cc
@@ -71,19 +74,19 @@ set(common_srcs
   hostname.cc
   ipaddr.cc
   iso_8601.cc
-  linux_version.c
   lockdep.cc
   mempool.cc
   mime.c
   mutex_debug.cc
   numa.cc
+  openssl_opts_handler.cc
   options.cc
   page.cc
   perf_counters.cc
   perf_counters_collection.cc
   perf_histogram.cc
   pick_address.cc
-  rabin.cc
+  random_string.cc
   reverse.c
   run_cmd.cc
   scrub_types.cc
@@ -95,10 +98,24 @@ set(common_srcs
   strtol.cc
   types.cc
   url_escape.cc
+  pretty_binary.cc
   utf8.c
   util.cc
-  version.cc
-  xattr.c)
+  version.cc)
+
+if(WIN32)
+  list(APPEND common_srcs
+    blkdev_win32.cc
+    dns_resolve_win32.cc
+    SubProcess_win32.cc
+    ifaddrs_win32.c)
+else()
+  list(APPEND common_srcs
+    blkdev.cc
+    dns_resolve.cc
+    linux_version.c
+    SubProcess.cc)
+endif()
 
 set_source_files_properties(${CMAKE_SOURCE_DIR}/src/common/version.cc
   APPEND PROPERTY OBJECT_DEPENDS ${CMAKE_BINARY_DIR}/src/include/ceph_ver.h)
@@ -126,6 +143,10 @@ endif()
 
 add_library(common-common-objs OBJECT
   ${common_srcs})
+# Let's not rely on the default system headers and point Cmake to the
+# retrieved OpenSSL location. This is especially important when cross
+# compiling (e.g. targeting Windows).
+target_include_directories(common-common-objs PRIVATE ${OPENSSL_INCLUDE_DIR})
 # for options.cc
 target_compile_definitions(common-common-objs PRIVATE
   "CEPH_LIBDIR=\"${CMAKE_INSTALL_FULL_LIBDIR}\""

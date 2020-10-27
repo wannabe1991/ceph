@@ -16,6 +16,7 @@
  *
 */
 
+#include "acconfig.h"
 #include "include/int_types.h"
 
 #include <libgen.h>
@@ -24,6 +25,7 @@
 #include <stddef.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -38,19 +40,29 @@
 #include <libnl3/netlink/genl/ctrl.h>
 #include <libnl3/netlink/genl/mngt.h>
 
+#if __has_include(<filesystem>)
+#include <filesystem>
+namespace fs = std::filesystem;
+#else
+#include <experimental/filesystem>
+namespace fs = std::experimental::filesystem;
+#endif
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <regex>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/lexical_cast.hpp>
 
 #include "common/Formatter.h"
 #include "common/Preforker.h"
+#include "common/SubProcess.h"
 #include "common/TextTable.h"
 #include "common/ceph_argparse.h"
 #include "common/config.h"
 #include "common/dout.h"
 #include "common/errno.h"
+#include "common/event_socket.h"
 #include "common/module.h"
 #include "common/safe_io.h"
 #include "common/version.h"
@@ -70,12 +82,23 @@
 #undef dout_prefix
 #define dout_prefix *_dout << "rbd-nbd: "
 
+enum Command {
+  None,
+  Map,
+  Unmap,
+  Attach,
+  Detach,
+  List
+};
+
 struct Config {
   int nbds_max = 0;
   int max_part = 255;
-  int timeout = -1;
+  int io_timeout = -1;
+  int reattach_timeout = 30;
 
   bool exclusive = false;
+  bool quiesce = false;
   bool readonly = false;
   bool set_max_part = false;
   bool try_netlink = false;
@@ -85,24 +108,50 @@ struct Config {
   std::string imgname;
   std::string snapname;
   std::string devpath;
+  std::string quiesce_hook = CMAKE_INSTALL_LIBEXECDIR "/rbd-nbd/rbd-nbd_quiesce";
 
   std::string format;
   bool pretty_format = false;
+
+  Command command = None;
+  int pid = 0;
+
+  std::string image_spec() const {
+    std::string spec = poolname + "/";
+
+    if (!nsname.empty()) {
+      spec += "/" + nsname;
+    }
+    spec += imgname;
+
+    if (!snapname.empty()) {
+      spec += "@" + snapname;
+    }
+
+    return spec;
+  }
 };
 
 static void usage()
 {
-  std::cout << "Usage: rbd-nbd [options] map <image-or-snap-spec>  Map an image to nbd device\n"
-            << "               unmap <device|image-or-snap-spec>   Unmap nbd device\n"
-            << "               [options] list-mapped               List mapped nbd devices\n"
-            << "Map options:\n"
-            << "  --device <device path>  Specify nbd device path (/dev/nbd{num})\n"
-            << "  --read-only             Map read-only\n"
-            << "  --nbds_max <limit>      Override for module param nbds_max\n"
-            << "  --max_part <limit>      Override for module param max_part\n"
-            << "  --exclusive             Forbid writes by other clients\n"
-            << "  --timeout <seconds>     Set nbd request timeout\n"
-            << "  --try-netlink           Use the nbd netlink interface\n"
+  std::cout << "Usage: rbd-nbd [options] map <image-or-snap-spec>    Map image to nbd device\n"
+            << "               detach <device|image-or-snap-spec>    Detach image from nbd device\n"
+            << "               [options] attach <image-or-snap-spec> Attach image to nbd device\n"
+            << "               unmap <device|image-or-snap-spec>     Unmap nbd device\n"
+            << "               [options] list-mapped                 List mapped nbd devices\n"
+            << "Map and attach options:\n"
+            << "  --device <device path>   Specify nbd device path (/dev/nbd{num})\n"
+            << "  --exclusive              Forbid writes by other clients\n"
+            << "  --io-timeout <sec>       Set nbd IO timeout\n"
+            << "  --max_part <limit>       Override for module param max_part\n"
+            << "  --nbds_max <limit>       Override for module param nbds_max\n"
+            << "  --quiesce                Use quiesce callbacks\n"
+            << "  --quiesce-hook <path>    Specify quiesce hook path\n"
+            << "                           (default: " << Config().quiesce_hook << ")\n"
+            << "  --read-only              Map read-only\n"
+            << "  --reattach-timeout <sec> Set nbd re-attach timeout\n"
+            << "                           (default: " << Config().reattach_timeout << ")\n"
+            << "  --try-netlink            Use the nbd netlink interface\n"
             << "\n"
             << "List options:\n"
             << "  --format plain|json|xml Output format (default: plain)\n"
@@ -113,15 +162,7 @@ static void usage()
 
 static int nbd = -1;
 static int nbd_index = -1;
-
-enum Command {
-  None,
-  Connect,
-  Disconnect,
-  List
-};
-
-static Command cmd = None;
+static EventSocket terminate_event_sock;
 
 #define RBD_NBD_BLKSIZE 512UL
 
@@ -138,40 +179,55 @@ static Command cmd = None;
 #define htonll(a) ntohll(a)
 
 static int parse_args(vector<const char*>& args, std::ostream *err_msg,
-                      Command *command, Config *cfg);
+                      Config *cfg);
 static int netlink_resize(int nbd_index, uint64_t size);
+
+static int run_quiesce_hook(const std::string &quiesce_hook,
+                            const std::string &devpath,
+                            const std::string &command);
 
 class NBDServer
 {
+public:
+  uint64_t quiesce_watch_handle = 0;
+
 private:
   int fd;
   librbd::Image &image;
+  Config *cfg;
 
 public:
-  NBDServer(int _fd, librbd::Image& _image)
-    : fd(_fd)
-    , image(_image)
+  NBDServer(int fd, librbd::Image& image, Config *cfg)
+    : fd(fd)
+    , image(image)
+    , cfg(cfg)
     , reader_thread(*this, &NBDServer::reader_entry)
     , writer_thread(*this, &NBDServer::writer_entry)
-    , started(false)
-  {}
+    , quiesce_thread(*this, &NBDServer::quiesce_entry)
+  {
+    std::vector<librbd::config_option_t> options;
+    image.config_list(&options);
+    for (auto &option : options) {
+      if ((option.name == std::string("rbd_cache") ||
+           option.name == std::string("rbd_cache_writethrough_until_flush")) &&
+          option.value == "false") {
+        allow_internal_flush = true;
+        break;
+      }
+    }
+  }
+
+  Config *get_cfg() const {
+    return cfg;
+  }
 
 private:
+  int terminate_event_fd = -1;
   ceph::mutex disconnect_lock =
     ceph::make_mutex("NBDServer::DisconnectLocker");
   ceph::condition_variable disconnect_cond;
   std::atomic<bool> terminated = { false };
-
-  void shutdown()
-  {
-    bool expected = false;
-    if (terminated.compare_exchange_strong(expected, true)) {
-      ::shutdown(fd, SHUT_RDWR);
-
-      std::lock_guard l{lock};
-      cond.notify_all();
-    }
-  }
+  std::atomic<bool> allow_internal_flush = { false };
 
   struct IOContext
   {
@@ -212,7 +268,10 @@ private:
   IOContext *wait_io_finish()
   {
     std::unique_lock l{lock};
-    cond.wait(l, [this] { return !io_finished.empty() || terminated; });
+    cond.wait(l, [this] {
+                   return !io_finished.empty() ||
+                          (io_pending.empty() && terminated);
+                 });
 
     if (io_finished.empty())
       return NULL;
@@ -225,7 +284,6 @@ private:
 
   void wait_clean()
   {
-    ceph_assert(!reader_thread.is_started());
     std::unique_lock l{lock};
     cond.wait(l, [this] { return io_pending.empty(); });
 
@@ -233,6 +291,16 @@ private:
       std::unique_ptr<IOContext> free_ctx(io_finished.front());
       io_finished.pop_front();
     }
+  }
+
+  void assert_clean()
+  {
+    std::unique_lock l{lock};
+
+    ceph_assert(!reader_thread.is_started());
+    ceph_assert(!writer_thread.is_started());
+    ceph_assert(io_pending.empty());
+    ceph_assert(io_finished.empty());
   }
 
   static void aio_callback(librbd::completion_t cb, void *arg)
@@ -272,13 +340,40 @@ private:
 
   void reader_entry()
   {
-    while (!terminated) {
+    struct pollfd poll_fds[2];
+    memset(poll_fds, 0, sizeof(struct pollfd) * 2);
+    poll_fds[0].fd = fd;
+    poll_fds[0].events = POLLIN;
+    poll_fds[1].fd = terminate_event_fd;
+    poll_fds[1].events = POLLIN;
+
+    while (true) {
       std::unique_ptr<IOContext> ctx(new IOContext());
       ctx->server = this;
 
       dout(20) << __func__ << ": waiting for nbd request" << dendl;
 
-      int r = safe_read_exact(fd, &ctx->request, sizeof(struct nbd_request));
+      int r = poll(poll_fds, 2, -1);
+      if (r == -1) {
+        if (errno == EINTR) {
+          continue;
+        }
+        r = -errno;
+        derr << "failed to poll nbd: " << cpp_strerror(r) << dendl;
+        goto signal;
+      }
+
+      if ((poll_fds[1].revents & POLLIN) != 0) {
+        dout(0) << __func__ << ": terminate received" << dendl;
+        goto signal;
+      }
+
+      if ((poll_fds[0].revents & POLLIN) == 0) {
+        dout(20) << __func__ << ": nothing to read" << dendl;
+        continue;
+      }
+
+      r = safe_read_exact(fd, &ctx->request, sizeof(struct nbd_request));
       if (r < 0) {
 	derr << "failed to read nbd request header: " << cpp_strerror(r)
 	     << dendl;
@@ -332,6 +427,7 @@ private:
           break;
         case NBD_CMD_FLUSH:
           image.aio_flush(c);
+          allow_internal_flush = true;
           break;
         case NBD_CMD_TRIM:
           image.aio_discard(pctx->request.from, pctx->request.len, c);
@@ -342,21 +438,25 @@ private:
           goto signal;
       }
     }
-    dout(20) << __func__ << ": terminated" << dendl;
-
 signal:
-    std::lock_guard l{disconnect_lock};
+    std::lock_guard l{lock};
+    terminated = true;
+    cond.notify_all();
+
+    std::lock_guard disconnect_l{disconnect_lock};
     disconnect_cond.notify_all();
+
+    dout(20) << __func__ << ": terminated" << dendl;
   }
 
   void writer_entry()
   {
-    while (!terminated) {
+    while (true) {
       dout(20) << __func__ << ": waiting for io request" << dendl;
       std::unique_ptr<IOContext> ctx(wait_io_finish());
       if (!ctx) {
 	dout(20) << __func__ << ": no io requests, terminating" << dendl;
-        return;
+        goto done;
       }
 
       dout(20) << __func__ << ": got: " << *ctx << dendl;
@@ -365,18 +465,98 @@ signal:
       if (r < 0) {
 	derr << *ctx << ": failed to write reply header: " << cpp_strerror(r)
 	     << dendl;
-        return;
+        goto error;
       }
       if (ctx->command == NBD_CMD_READ && ctx->reply.error == htonl(0)) {
 	r = ctx->data.write_fd(fd);
         if (r < 0) {
 	  derr << *ctx << ": failed to write replay data: " << cpp_strerror(r)
 	       << dendl;
-          return;
+          goto error;
 	}
       }
       dout(20) << *ctx << ": finish" << dendl;
     }
+  error:
+    wait_clean();
+  done:
+    ::shutdown(fd, SHUT_RDWR);
+
+    dout(20) << __func__ << ": terminated" << dendl;
+  }
+
+  bool wait_quiesce() {
+    dout(20) << __func__ << dendl;
+
+    std::unique_lock locker{lock};
+    cond.wait(locker, [this] { return quiesce || terminated; });
+
+    if (terminated) {
+      return false;
+    }
+
+    dout(20) << __func__ << ": got quiesce request" << dendl;
+    return true;
+  }
+
+  void wait_unquiesce(std::unique_lock<ceph::mutex> &locker) {
+    dout(20) << __func__ << dendl;
+
+    cond.wait(locker, [this] { return !quiesce || terminated; });
+
+    dout(20) << __func__ << ": got unquiesce request" << dendl;
+  }
+
+  void wait_inflight_io() {
+    if (!allow_internal_flush) {
+        return;
+    }
+
+    uint64_t features = 0;
+    image.features(&features);
+    if ((features & RBD_FEATURE_EXCLUSIVE_LOCK) != 0) {
+      bool is_owner = false;
+      image.is_exclusive_lock_owner(&is_owner);
+      if (!is_owner) {
+        return;
+      }
+    }
+
+    dout(20) << __func__ << dendl;
+
+    int r = image.flush();
+    if (r < 0) {
+      derr << "flush failed: " << cpp_strerror(r) << dendl;
+    }
+  }
+
+  void quiesce_entry()
+  {
+    ceph_assert(cfg->quiesce);
+
+    while (wait_quiesce()) {
+
+      int r = run_quiesce_hook(cfg->quiesce_hook, cfg->devpath, "quiesce");
+
+      wait_inflight_io();
+
+      {
+        std::unique_lock locker{lock};
+        ceph_assert(quiesce == true);
+
+        image.quiesce_complete(quiesce_watch_handle, r);
+
+        if (r < 0) {
+          quiesce = false;
+          continue;
+        }
+
+        wait_unquiesce(locker);
+      }
+
+      run_quiesce_hook(cfg->quiesce_hook, cfg->devpath, "unquiesce");
+    }
+
     dout(20) << __func__ << ": terminated" << dendl;
   }
 
@@ -396,12 +576,13 @@ signal:
     void* entry() override
     {
       (server.*func)();
-      server.shutdown();
       return NULL;
     }
-  } reader_thread, writer_thread;
+  } reader_thread, writer_thread, quiesce_thread;
 
-  bool started;
+  bool started = false;
+  bool quiesce = false;
+
 public:
   void start()
   {
@@ -410,8 +591,17 @@ public:
 
       started = true;
 
+      terminate_event_fd = eventfd(0, EFD_NONBLOCK);
+      ceph_assert(terminate_event_fd > 0);
+      int r = terminate_event_sock.init(terminate_event_fd,
+                                        EVENT_SOCKET_TYPE_EVENTFD);
+      ceph_assert(r >= 0);
+
       reader_thread.create("rbd_reader");
       writer_thread.create("rbd_writer");
+      if (cfg->quiesce) {
+        quiesce_thread.create("rbd_quiesce");
+      }
     }
   }
 
@@ -424,18 +614,44 @@ public:
     disconnect_cond.wait(l);
   }
 
+  void notify_quiesce() {
+    dout(10) << __func__ << dendl;
+
+    ceph_assert(cfg->quiesce);
+
+    std::unique_lock locker{lock};
+    ceph_assert(quiesce == false);
+    quiesce = true;
+    cond.notify_all();
+  }
+
+  void notify_unquiesce() {
+    dout(10) << __func__ << dendl;
+
+    ceph_assert(cfg->quiesce);
+
+    std::unique_lock locker{lock};
+    ceph_assert(quiesce == true);
+    quiesce = false;
+    cond.notify_all();
+  }
+
   ~NBDServer()
   {
     if (started) {
       dout(10) << __func__ << ": terminating" << dendl;
 
-      shutdown();
+      terminate_event_sock.notify();
 
       reader_thread.join();
       writer_thread.join();
+      if (cfg->quiesce) {
+        quiesce_thread.join();
+      }
 
-      wait_clean();
+      assert_clean();
 
+      close(terminate_event_fd);
       started = false;
     }
   }
@@ -459,6 +675,9 @@ std::ostream &operator<<(std::ostream &os, const NBDServer::IOContext &ctx) {
   case NBD_CMD_TRIM:
     os << " TRIM ";
     break;
+  case NBD_CMD_DISC:
+    os << " DISC ";
+    break;
   default:
     os << " UNKNOWN(" << ctx.command << ") ";
     break;
@@ -469,6 +688,24 @@ std::ostream &operator<<(std::ostream &os, const NBDServer::IOContext &ctx) {
 
   return os;
 }
+
+class NBDQuiesceWatchCtx : public librbd::QuiesceWatchCtx
+{
+public:
+  NBDQuiesceWatchCtx(NBDServer *server) : server(server) {
+  }
+
+  void handle_quiesce() override {
+    server->notify_quiesce();
+  }
+
+  void handle_unquiesce() override {
+    server->notify_unquiesce();
+  }
+
+private:
+  NBDServer *server;
+};
 
 class NBDWatchCtx : public librbd::UpdateWatchCtx
 {
@@ -532,7 +769,7 @@ public:
 
 class NBDListIterator {
 public:
-  bool get(int *pid, Config *cfg) {
+  bool get(Config *cfg) {
     while (true) {
       std::string nbd_path = "/sys/block/nbd" + stringify(m_index);
       if(access(nbd_path.c_str(), F_OK) != 0) {
@@ -542,26 +779,52 @@ public:
       *cfg = Config();
       cfg->devpath = "/dev/nbd" + stringify(m_index++);
 
+      int pid;
       std::ifstream ifs;
       ifs.open(nbd_path + "/pid", std::ifstream::in);
       if (!ifs.is_open()) {
         continue;
       }
-      ifs >> *pid;
+      ifs >> pid;
 
-      int r = get_mapped_info(*pid, cfg);
-      if (r < 0) {
-        continue;
-      }
+      // If the rbd-nbd is re-attached the pid may store garbage
+      // here. We are sure this is the case when it is negative or
+      // zero. Then we just try to find the attached process scanning
+      // /proc fs. If it is positive we check the process with this
+      // pid first and if it is not rbd-nbd fallback to searching the
+      // attached process.
+      do {
+        if (pid <= 0) {
+          pid = find_attached(cfg->devpath);
+          if (pid <= 0) {
+            break;
+          }
+        }
 
-      return true;
+        if (get_mapped_info(pid, cfg) >= 0) {
+          return true;
+        }
+        pid = -1;
+      } while (true);
     }
   }
 
 private:
   int m_index = 0;
+  std::map<int, Config> m_mapped_info_cache;
 
   int get_mapped_info(int pid, Config *cfg) {
+    auto it = m_mapped_info_cache.find(pid);
+    if (it != m_mapped_info_cache.end()) {
+      if (it->second.devpath.empty()) {
+        return -EINVAL;
+      }
+      *cfg = it->second;
+      return 0;
+    }
+
+    m_mapped_info_cache[pid] = {};
+
     int r;
     std::string path = "/proc/" + stringify(pid) + "/cmdline";
     std::ifstream ifs;
@@ -572,6 +835,10 @@ private:
     if (!ifs.is_open())
       return -1;
     ifs >> cmdline;
+
+    if (cmdline.empty()) {
+      return -EINVAL;
+    }
 
     for (unsigned i = 0; i < cmdline.size(); i++) {
       char *arg = &cmdline[i];
@@ -589,17 +856,46 @@ private:
     }
 
     std::ostringstream err_msg;
-    Command command;
-    r = parse_args(args, &err_msg, &command, cfg);
+    r = parse_args(args, &err_msg, cfg);
     if (r < 0) {
       return r;
     }
 
-    if (command != Connect) {
+    if (cfg->command != Map && cfg->command != Attach) {
       return -ENOENT;
     }
 
+    cfg->pid = pid;
+
+    m_mapped_info_cache.erase(pid);
+    if (!cfg->devpath.empty()) {
+      m_mapped_info_cache[pid] = *cfg;
+    }
+
     return 0;
+  }
+
+  int find_attached(const std::string &devpath) {
+    for (auto &entry : fs::directory_iterator("/proc")) {
+      if (!fs::is_directory(entry.status())) {
+        continue;
+      }
+
+      int pid;
+      try {
+        pid = boost::lexical_cast<uint64_t>(entry.path().filename().c_str());
+      } catch (boost::bad_lexical_cast&) {
+        continue;
+      }
+
+      Config cfg;
+      if (get_mapped_info(pid, &cfg) >=0 && cfg.devpath == devpath &&
+          cfg.command == Attach) {
+        return cfg.pid;
+      }
+    }
+
+    return -1;
   }
 };
 
@@ -744,22 +1040,24 @@ static int try_ioctl_setup(Config *cfg, int fd, uint64_t size, uint64_t flags)
   r = ioctl(nbd, NBD_SET_BLKSIZE, RBD_NBD_BLKSIZE);
   if (r < 0) {
     r = -errno;
+    cerr << "rbd-nbd: NBD_SET_BLKSIZE failed" << std::endl;
     goto close_nbd;
   }
 
   r = ioctl(nbd, NBD_SET_SIZE, size);
   if (r < 0) {
+    cerr << "rbd-nbd: NBD_SET_SIZE failed" << std::endl;
     r = -errno;
     goto close_nbd;
   }
 
   ioctl(nbd, NBD_SET_FLAGS, flags);
 
-  if (cfg->timeout >= 0) {
-    r = ioctl(nbd, NBD_SET_TIMEOUT, (unsigned long)cfg->timeout);
+  if (cfg->io_timeout >= 0) {
+    r = ioctl(nbd, NBD_SET_TIMEOUT, (unsigned long)cfg->io_timeout);
     if (r < 0) {
       r = -errno;
-      cerr << "rbd-nbd: failed to set timeout: " << cpp_strerror(r)
+      cerr << "rbd-nbd: failed to set IO timeout: " << cpp_strerror(r)
            << std::endl;
       goto close_nbd;
     }
@@ -950,14 +1248,21 @@ static int netlink_connect_cb(struct nl_msg *msg, void *arg)
 }
 
 static int netlink_connect(Config *cfg, struct nl_sock *sock, int nl_id, int fd,
-                           uint64_t size, uint64_t flags)
+                           uint64_t size, uint64_t flags, bool reconnect)
 {
   struct nlattr *sock_attr;
   struct nlattr *sock_opt;
   struct nl_msg *msg;
   int ret;
 
-  nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM, netlink_connect_cb, cfg);
+  if (reconnect) {
+    dout(10) << "netlink try reconnect for " << cfg->devpath << dendl;
+
+    nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM, genl_handle_msg, NULL);
+  } else {
+    nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM, netlink_connect_cb,
+                        cfg);
+  }
 
   msg = nlmsg_alloc();
   if (!msg) {
@@ -965,8 +1270,8 @@ static int netlink_connect(Config *cfg, struct nl_sock *sock, int nl_id, int fd,
     return -ENOMEM;
   }
 
-  if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, nl_id, 0, 0, NBD_CMD_CONNECT,
-                   0)) {
+  if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, nl_id, 0, 0,
+                   reconnect ? NBD_CMD_RECONFIGURE : NBD_CMD_CONNECT, 0)) {
     cerr << "rbd-nbd: Could not setup message." << std::endl;
     goto free_msg;
   }
@@ -977,14 +1282,18 @@ static int netlink_connect(Config *cfg, struct nl_sock *sock, int nl_id, int fd,
       goto free_msg;
 
     NLA_PUT_U32(msg, NBD_ATTR_INDEX, ret);
+    if (reconnect) {
+      nbd_index = ret;
+    }
   }
 
-  if (cfg->timeout >= 0)
-    NLA_PUT_U64(msg, NBD_ATTR_TIMEOUT, cfg->timeout);
+  if (cfg->io_timeout >= 0)
+    NLA_PUT_U64(msg, NBD_ATTR_TIMEOUT, cfg->io_timeout);
 
   NLA_PUT_U64(msg, NBD_ATTR_SIZE_BYTES, size);
   NLA_PUT_U64(msg, NBD_ATTR_BLOCK_SIZE_BYTES, RBD_NBD_BLKSIZE);
   NLA_PUT_U64(msg, NBD_ATTR_SERVER_FLAGS, flags);
+  NLA_PUT_U64(msg, NBD_ATTR_DEAD_CONN_TIMEOUT, cfg->reattach_timeout);
 
   sock_attr = nla_nest_start(msg, NBD_ATTR_SOCKETS);
   if (!sock_attr) {
@@ -1018,7 +1327,8 @@ free_msg:
   return -EIO;
 }
 
-static int try_netlink_setup(Config *cfg, int fd, uint64_t size, uint64_t flags)
+static int try_netlink_setup(Config *cfg, int fd, uint64_t size, uint64_t flags,
+                             bool reconnect)
 {
   struct nl_sock *sock;
   int nl_id, ret;
@@ -1032,7 +1342,7 @@ static int try_netlink_setup(Config *cfg, int fd, uint64_t size, uint64_t flags)
 
   dout(10) << "netlink interface supported." << dendl;
 
-  ret = netlink_connect(cfg, sock, nl_id, fd, size, flags);
+  ret = netlink_connect(cfg, sock, nl_id, fd, size, flags, reconnect);
   netlink_cleanup(sock);
 
   if (ret != 0)
@@ -1047,35 +1357,52 @@ static int try_netlink_setup(Config *cfg, int fd, uint64_t size, uint64_t flags)
   return 0;
 }
 
+static int run_quiesce_hook(const std::string &quiesce_hook,
+                            const std::string &devpath,
+                            const std::string &command) {
+  dout(10) << __func__ << ": " << quiesce_hook << " " << devpath << " "
+           << command << dendl;
+
+  SubProcess hook(quiesce_hook.c_str(), SubProcess::CLOSE, SubProcess::PIPE,
+                  SubProcess::PIPE);
+  hook.add_cmd_args(devpath.c_str(), command.c_str(), NULL);
+  bufferlist err;
+  int r = hook.spawn();
+  if (r < 0) {
+    err.append("subprocess spawn failed");
+  } else {
+    err.read_fd(hook.get_stderr(), 16384);
+    r = hook.join();
+    if (r > 0) {
+      r = -r;
+    }
+  }
+  if (r < 0) {
+    derr << __func__ << ": " << quiesce_hook << " " << devpath << " "
+         << command << " failed: " << err.to_str() << dendl;
+  } else {
+    dout(10) << " succeeded: " << err.to_str() << dendl;
+  }
+
+  return r;
+}
+
 static void handle_signal(int signum)
 {
-  int ret;
-
   ceph_assert(signum == SIGINT || signum == SIGTERM);
   derr << "*** Got signal " << sig_str(signum) << " ***" << dendl;
 
-  if (nbd < 0 || nbd_index < 0) {
-    dout(20) << __func__ << ": " << "disconnect not needed." << dendl;
-    return;
-  }
+  dout(20) << __func__ << ": " << "notifying terminate" << dendl;
 
-  dout(20) << __func__ << ": " << "sending NBD_DISCONNECT" << dendl;
-  ret = netlink_disconnect(nbd_index);
-  if (ret == 1)
-    ret = ioctl(nbd, NBD_DISCONNECT);
-
-  if (ret != 0) {
-    derr << "rbd-nbd: disconnect failed. Error: " << ret << dendl;
-  } else {
-    dout(20) << __func__ << ": " << "disconnected" << dendl;
-  }
+  ceph_assert(terminate_event_sock.is_valid());
+  terminate_event_sock.notify();
 }
 
-static NBDServer *start_server(int fd, librbd::Image& image)
+static NBDServer *start_server(int fd, librbd::Image& image, Config *cfg)
 {
   NBDServer *server;
 
-  server = new NBDServer(fd, image);
+  server = new NBDServer(fd, image, cfg);
   server->start();
 
   init_async_signal_handler();
@@ -1104,7 +1431,58 @@ static void run_server(Preforker& forker, NBDServer *server, bool netlink_used)
   shutdown_async_signal_handler();
 }
 
-static int do_map(int argc, const char *argv[], Config *cfg)
+// Eventually it should be replaced with glibc' pidfd_open
+// when it is widely available.
+static int
+pidfd_open(pid_t pid, unsigned int)
+{
+  std::string path = "/proc/" + stringify(pid);
+  int fd = open(path.c_str(), O_RDONLY);
+  if (fd == -1 && errno == ENOENT) {
+    errno = ESRCH;
+  }
+
+  return fd;
+}
+
+static int wait_for_terminate(int pid, int timeout)
+{
+  int fd = pidfd_open(pid, 0);
+  if (fd == -1) {
+    if (errno == -ESRCH) {
+      return 0;
+    }
+    int r = -errno;
+    cerr << "rbd-nbd: pidfd_open(" << pid << ") failed: "
+         << cpp_strerror(r) << std::endl;
+    return r;
+  }
+
+  struct pollfd poll_fds[1];
+  memset(poll_fds, 0, sizeof(struct pollfd));
+  poll_fds[0].fd = fd;
+  poll_fds[0].events = POLLIN;
+
+  int r = poll(poll_fds, 1, timeout * 1000);
+  if (r == -1) {
+    r = -errno;
+    cerr << "rbd-nbd: failed to poll rbd-nbd process: " << cpp_strerror(r)
+         << std::endl;
+    goto done;
+  }
+
+  if ((poll_fds[0].revents & POLLIN) == 0) {
+    cerr << "rbd-nbd: waiting for process exit timed out" << std::endl;
+    r = -ETIMEDOUT;
+  }
+
+done:
+  close(fd);
+
+  return r;
+}
+
+static int do_map(int argc, const char *argv[], Config *cfg, bool reconnect)
 {
   int r;
 
@@ -1221,11 +1599,11 @@ static int do_map(int argc, const char *argv[], Config *cfg)
   if (r < 0)
     goto close_fd;
 
-  server = start_server(fd[1], image);
+  server = start_server(fd[1], image, cfg);
 
-  use_netlink = cfg->try_netlink;
+  use_netlink = cfg->try_netlink || reconnect;
   if (use_netlink) {
-    r = try_netlink_setup(cfg, fd[0], size, flags);
+    r = try_netlink_setup(cfg, fd[0], size, flags, reconnect);
     if (r < 0) {
       goto free_server;
     } else if (r == 1) {
@@ -1250,6 +1628,15 @@ static int do_map(int argc, const char *argv[], Config *cfg)
   }
 
   {
+    NBDQuiesceWatchCtx quiesce_watch_ctx(server);
+    if (cfg->quiesce) {
+      r = image.quiesce_watch(&quiesce_watch_ctx,
+                              &server->quiesce_watch_handle);
+      if (r < 0) {
+        goto close_nbd;
+      }
+    }
+
     uint64_t handle;
 
     NBDWatchCtx watch_ctx(nbd, nbd_index, use_netlink, io_ctx, image,
@@ -1261,6 +1648,11 @@ static int do_map(int argc, const char *argv[], Config *cfg)
     cout << cfg->devpath << std::endl;
 
     run_server(forker, server, use_netlink);
+
+    if (cfg->quiesce) {
+      r = image.quiesce_unwatch(server->quiesce_watch_handle);
+      ceph_assert(r == 0);
+    }
 
     r = image.update_unwatch(handle);
     ceph_assert(r == 0);
@@ -1292,6 +1684,19 @@ close_ret:
   return r;
 }
 
+static int do_detach(Config *cfg)
+{
+  int r = kill(cfg->pid, SIGTERM);
+  if (r == -1) {
+    r = -errno;
+    cerr << "rbd-nbd: failed to terminate " << cfg->pid << ": "
+         << cpp_strerror(r) << std::endl;
+    return r;
+  }
+
+  return wait_for_terminate(cfg->pid, cfg->reattach_timeout);
+}
+
 static int do_unmap(Config *cfg)
 {
   int r, nbd;
@@ -1316,7 +1721,12 @@ static int do_unmap(Config *cfg)
   }
 
   close(nbd);
-  return r;
+
+  if (r < 0) {
+    return r;
+  }
+
+  return wait_for_terminate(cfg->pid, cfg->reattach_timeout);
 }
 
 static int parse_imgpath(const std::string &imgpath, Config *cfg,
@@ -1370,13 +1780,12 @@ static int do_list_mapped_devices(const std::string &format, bool pretty_format)
     tbl.define_column("device", TextTable::LEFT, TextTable::LEFT);
   }
 
-  int pid;
   Config cfg;
   NBDListIterator it;
-  while (it.get(&pid, &cfg)) {
+  while (it.get(&cfg)) {
     if (f) {
       f->open_object_section("device");
-      f->dump_int("id", pid);
+      f->dump_int("id", cfg.pid);
       f->dump_string("pool", cfg.poolname);
       f->dump_string("namespace", cfg.nsname);
       f->dump_string("image", cfg.imgname);
@@ -1388,8 +1797,8 @@ static int do_list_mapped_devices(const std::string &format, bool pretty_format)
       if (cfg.snapname.empty()) {
         cfg.snapname = "-";
       }
-      tbl << pid << cfg.poolname << cfg.nsname << cfg.imgname << cfg.snapname
-          << cfg.devpath << TextTable::endrow;
+      tbl << cfg.pid << cfg.poolname << cfg.nsname << cfg.imgname
+          << cfg.snapname << cfg.devpath << TextTable::endrow;
     }
   }
 
@@ -1403,13 +1812,13 @@ static int do_list_mapped_devices(const std::string &format, bool pretty_format)
   return 0;
 }
 
-static bool find_mapped_dev_by_spec(Config *cfg) {
-  int pid;
+static bool find_mapped_dev_by_spec(Config *cfg, int skip_pid=-1) {
   Config c;
   NBDListIterator it;
-  while (it.get(&pid, &c)) {
-    if (c.poolname == cfg->poolname && c.imgname == cfg->imgname &&
-        c.snapname == cfg->snapname) {
+  while (it.get(&c)) {
+    if (c.pid != skip_pid &&
+        c.poolname == cfg->poolname && c.nsname == cfg->nsname &&
+        c.imgname == cfg->imgname && c.snapname == cfg->snapname) {
       *cfg = c;
       return true;
     }
@@ -1419,7 +1828,7 @@ static bool find_mapped_dev_by_spec(Config *cfg) {
 
 
 static int parse_args(vector<const char*>& args, std::ostream *err_msg,
-                      Command *command, Config *cfg) {
+                      Config *cfg) {
   std::string conf_file_list;
   std::string cluster;
   CephInitParameters iparams = ceph_argparse_early_args(
@@ -1447,6 +1856,16 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
     } else if (ceph_argparse_flag(args, i, "-v", "--version", (char*)NULL)) {
       return VERSION_INFO;
     } else if (ceph_argparse_witharg(args, i, &cfg->devpath, "--device", (char *)NULL)) {
+    } else if (ceph_argparse_witharg(args, i, &cfg->io_timeout, err,
+                                     "--io-timeout", (char *)NULL)) {
+      if (!err.str().empty()) {
+        *err_msg << "rbd-nbd: " << err.str();
+        return -EINVAL;
+      }
+      if (cfg->io_timeout < 0) {
+        *err_msg << "rbd-nbd: Invalid argument for io-timeout!";
+        return -EINVAL;
+      }
     } else if (ceph_argparse_witharg(args, i, &cfg->nbds_max, err, "--nbds_max", (char *)NULL)) {
       if (!err.str().empty()) {
         *err_msg << "rbd-nbd: " << err.str();
@@ -1466,20 +1885,35 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
         return -EINVAL;
       }
       cfg->set_max_part = true;
+    } else if (ceph_argparse_flag(args, i, "--quiesce", (char *)NULL)) {
+      cfg->quiesce = true;
+    } else if (ceph_argparse_witharg(args, i, &cfg->quiesce_hook,
+                                     "--quiesce-hook", (char *)NULL)) {
     } else if (ceph_argparse_flag(args, i, "--read-only", (char *)NULL)) {
       cfg->readonly = true;
-    } else if (ceph_argparse_flag(args, i, "--exclusive", (char *)NULL)) {
-      cfg->exclusive = true;
-    } else if (ceph_argparse_witharg(args, i, &cfg->timeout, err, "--timeout",
-                                     (char *)NULL)) {
+    } else if (ceph_argparse_witharg(args, i, &cfg->reattach_timeout, err,
+                                     "--reattach-timeout", (char *)NULL)) {
       if (!err.str().empty()) {
         *err_msg << "rbd-nbd: " << err.str();
         return -EINVAL;
       }
-      if (cfg->timeout < 0) {
+      if (cfg->reattach_timeout < 0) {
+        *err_msg << "rbd-nbd: Invalid argument for reattach-timeout!";
+        return -EINVAL;
+      }
+    } else if (ceph_argparse_flag(args, i, "--exclusive", (char *)NULL)) {
+      cfg->exclusive = true;
+    } else if (ceph_argparse_witharg(args, i, &cfg->io_timeout, err,
+                                     "--timeout", (char *)NULL)) {
+      if (!err.str().empty()) {
+        *err_msg << "rbd-nbd: " << err.str();
+        return -EINVAL;
+      }
+      if (cfg->io_timeout < 0) {
         *err_msg << "rbd-nbd: Invalid argument for timeout!";
         return -EINVAL;
       }
+      *err_msg << "rbd-nbd: --timeout is deprecated (use --io-timeout)";
     } else if (ceph_argparse_witharg(args, i, &cfg->format, err, "--format",
                                      (char *)NULL)) {
     } else if (ceph_argparse_flag(args, i, "--pretty-format", (char *)NULL)) {
@@ -1494,9 +1928,13 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
   Command cmd = None;
   if (args.begin() != args.end()) {
     if (strcmp(*args.begin(), "map") == 0) {
-      cmd = Connect;
+      cmd = Map;
     } else if (strcmp(*args.begin(), "unmap") == 0) {
-      cmd = Disconnect;
+      cmd = Unmap;
+    } else if (strcmp(*args.begin(), "attach") == 0) {
+      cmd = Attach;
+    } else if (strcmp(*args.begin(), "detach") == 0) {
+      cmd = Detach;
     } else if (strcmp(*args.begin(), "list-mapped") == 0) {
       cmd = List;
     } else {
@@ -1512,7 +1950,13 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
   }
 
   switch (cmd) {
-    case Connect:
+    case Attach:
+      if (cfg->devpath.empty()) {
+        *err_msg << "rbd-nbd: must specify device to attach";
+        return -EINVAL;
+      }      
+      [[fallthrough]];
+    case Map:
       if (args.begin() == args.end()) {
         *err_msg << "rbd-nbd: must specify image-or-snap-spec";
         return -EINVAL;
@@ -1522,7 +1966,8 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
       }
       args.erase(args.begin());
       break;
-    case Disconnect:
+    case Detach:
+    case Unmap:
       if (args.begin() == args.end()) {
         *err_msg << "rbd-nbd: must specify nbd device or image-or-snap-spec";
         return -EINVAL;
@@ -1532,10 +1977,6 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
       } else {
         if (parse_imgpath(*args.begin(), cfg, err_msg) < 0) {
           return -EINVAL;
-        }
-        if (!find_mapped_dev_by_spec(cfg)) {
-          *err_msg << "rbd-nbd: " << *args.begin() << " is not mapped";
-          return -ENOENT;
         }
       }
       args.erase(args.begin());
@@ -1550,7 +1991,7 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
     return -EINVAL;
   }
 
-  *command = cmd;
+  cfg->command = cmd;
   return 0;
 }
 
@@ -1562,7 +2003,7 @@ static int rbd_nbd(int argc, const char *argv[])
   argv_to_vec(argc, argv, args);
 
   std::ostringstream err_msg;
-  r = parse_args(args, &err_msg, &cmd, &cfg);
+  r = parse_args(args, &err_msg, &cfg);
   if (r == HELP_INFO) {
     usage();
     return 0;
@@ -1574,18 +2015,45 @@ static int rbd_nbd(int argc, const char *argv[])
     return r;
   }
 
-  switch (cmd) {
-    case Connect:
+  if (!err_msg.str().empty()) {
+    cerr << err_msg.str() << std::endl;
+  }
+
+  switch (cfg.command) {
+    case Attach:
+      ceph_assert(!cfg.devpath.empty());
+      if (find_mapped_dev_by_spec(&cfg, getpid())) {
+        cerr << "rbd-nbd: " << cfg.devpath << " has process " << cfg.pid
+             << " connected" << std::endl;
+        return -EBUSY;
+      }
+      [[fallthrough]];
+    case Map:
       if (cfg.imgname.empty()) {
         cerr << "rbd-nbd: image name was not specified" << std::endl;
         return -EINVAL;
       }
 
-      r = do_map(argc, argv, &cfg);
+      r = do_map(argc, argv, &cfg, cfg.command == Attach);
       if (r < 0)
         return -EINVAL;
       break;
-    case Disconnect:
+    case Detach:
+      if (cfg.devpath.empty() && !find_mapped_dev_by_spec(&cfg)) {
+        cerr << "rbd-nbd: " << cfg.image_spec() << " is not mapped"
+             << std::endl;
+        return -ENOENT;
+      }
+      r = do_detach(&cfg);
+      if (r < 0)
+        return -EINVAL;
+      break;
+    case Unmap:
+      if (cfg.devpath.empty() && !find_mapped_dev_by_spec(&cfg)) {
+        cerr << "rbd-nbd: " << cfg.image_spec() << " is not mapped"
+             << std::endl;
+        return -ENOENT;
+      }
       r = do_unmap(&cfg);
       if (r < 0)
         return -EINVAL;

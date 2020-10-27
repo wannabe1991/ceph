@@ -14,34 +14,51 @@
 #include "rgw_rest_s3.h"
 #include "rgw_arn.h"
 #include "rgw_auth_s3.h"
+#include "rgw_notify.h"
+#include "rgw_sal_rados.h"
 #include "services/svc_zone.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
+
 // command (AWS compliant): 
 // POST
-// Action=CreateTopic&Name=<topic-name>[&push-endpoint=<endpoint>[&<arg1>=<value1>]]
+// Action=CreateTopic&Name=<topic-name>[&OpaqueData=data][&push-endpoint=<endpoint>[&persistent][&<arg1>=<value1>]]
 class RGWPSCreateTopic_ObjStore_AWS : public RGWPSCreateTopicOp {
 public:
   int get_params() override {
     topic_name = s->info.args.get("Name");
     if (topic_name.empty()) {
-        ldout(s->cct, 1) << "CreateTopic Action 'Name' argument is missing" << dendl;
-        return -EINVAL;
+      ldout(s->cct, 1) << "CreateTopic Action 'Name' argument is missing" << dendl;
+      return -EINVAL;
     }
 
+    opaque_data = s->info.args.get("OpaqueData");
+
     dest.push_endpoint = s->info.args.get("push-endpoint");
-    for (const auto param : s->info.args.get_params()) {
-        if (param.first == "Action" || param.first == "Name" || param.first == "PayloadHash") {
-            continue;
-        }
-        dest.push_endpoint_args.append(param.first+"="+param.second+"&");
+    dest.persistent = s->info.args.exists("persistent");
+
+    if (!validate_and_update_endpoint_secret(dest, s->cct, *(s->info.env))) {
+      return -EINVAL;
+    }
+    for (const auto& param : s->info.args.get_params()) {
+      if (param.first == "Action" || param.first == "Name" || param.first == "PayloadHash") {
+        continue;
+      }
+      dest.push_endpoint_args.append(param.first+"="+param.second+"&");
     }
 
     if (!dest.push_endpoint_args.empty()) {
-        // remove last separator
-        dest.push_endpoint_args.pop_back();
+      // remove last separator
+      dest.push_endpoint_args.pop_back();
+    }
+    if (!dest.push_endpoint.empty() && dest.persistent) {
+      const auto ret = rgw::notify::add_persistent_topic(topic_name, s->yield);
+      if (ret < 0) {
+        ldout(s->cct, 1) << "CreateTopic Action failed to create queue for persistent topics. error:" << ret << dendl;
+        return ret;
+      }
     }
     
     // dest object only stores endpoint info
@@ -52,7 +69,7 @@ public:
     // the topic ARN will be sent in the reply
     const rgw::ARN arn(rgw::Partition::aws, rgw::Service::sns, 
         store->svc()->zone->get_zonegroup().get_name(),
-        s->user->user_id.tenant, topic_name);
+        s->user->get_tenant(), topic_name);
     topic_arn = arn.to_string();
     return 0;
   }
@@ -160,11 +177,24 @@ public:
     const auto topic_arn = rgw::ARN::parse((s->info.args.get("TopicArn")));
 
     if (!topic_arn || topic_arn->resource.empty()) {
-        ldout(s->cct, 1) << "DeleteTopic Action 'TopicArn' argument is missing or invalid" << dendl;
-        return -EINVAL;
+      ldout(s->cct, 1) << "DeleteTopic Action 'TopicArn' argument is missing or invalid" << dendl;
+      return -EINVAL;
     }
 
     topic_name = topic_arn->resource;
+
+    // upon deletion it is not known if topic is persistent or not
+    // will try to delete the persistent topic anyway
+    const auto ret = rgw::notify::remove_persistent_topic(topic_name, s->yield);
+    if (ret == -ENOENT) {
+      // topic was not persistent, or already deleted
+      return 0;
+    }
+    if (ret < 0) {
+      ldout(s->cct, 1) << "DeleteTopic Action failed to remove queue for persistent topics. error:" << ret << dendl;
+      return ret;
+    }
+
     return 0;
   }
   
@@ -199,21 +229,21 @@ namespace {
 // ctor and set are done according to the "type" argument
 // if type is not "key" or "value" its a no-op
 class Attribute {
-    std::string key;
-    std::string value;
+  std::string key;
+  std::string value;
 public:
-    Attribute(const std::string& type, const std::string& key_or_value) {
-        set(type, key_or_value);
+  Attribute(const std::string& type, const std::string& key_or_value) {
+    set(type, key_or_value);
+  }
+  void set(const std::string& type, const std::string& key_or_value) {
+    if (type == "key") {
+      key = key_or_value;
+    } else if (type == "value") {
+      value = key_or_value;
     }
-    void set(const std::string& type, const std::string& key_or_value) {
-        if (type == "key") {
-            key = key_or_value;
-        } else if (type == "value") {
-            value = key_or_value;
-        }
-    }
-    const std::string& get_key() const { return key; }
-    const std::string& get_value() const { return value; }
+  }
+  const std::string& get_key() const { return key; }
+  const std::string& get_value() const { return value; }
 };
 
 using AttributeMap = std::map<unsigned, Attribute>;
@@ -292,7 +322,7 @@ void RGWHandler_REST_PSTopic_AWS::rgw_topic_parse_input() {
         }
       }
       // update the regular args with the content of the attribute map
-      for (const auto attr : map) {
+      for (const auto& attr : map) {
           s->info.args.append(attr.second.get_key(), attr.second.get_value());
       }
     }
@@ -431,11 +461,11 @@ void RGWPSCreateNotif_ObjStore_S3::execute() {
   if (store->getRados()->get_sync_module()) {
     const auto psmodule = dynamic_cast<RGWPSSyncModuleInstance*>(store->getRados()->get_sync_module().get());
     if (psmodule) {
-        const auto& conf = psmodule->get_effective_conf();
-        data_bucket_prefix = conf["data_bucket_prefix"];
-        data_oid_prefix = conf["data_oid_prefix"];
-        // TODO: allow "push-only" on PS zone as well
-        push_only = false;
+      const auto& conf = psmodule->get_effective_conf();
+      data_bucket_prefix = conf["data_bucket_prefix"];
+      data_oid_prefix = conf["data_oid_prefix"];
+      // TODO: allow "push-only" on PS zone as well
+      push_only = false;
     }
   }
 
@@ -484,7 +514,7 @@ void RGWPSCreateNotif_ObjStore_S3::execute() {
     // generate the internal topic. destination is stored here for the "push-only" case
     // when no subscription exists
     // ARN is cached to make the "GET" method faster
-    op_ret = ups->create_topic(unique_topic_name, topic_info.dest, topic_info.arn);
+    op_ret = ups->create_topic(unique_topic_name, topic_info.dest, topic_info.arn, topic_info.opaque_data);
     if (op_ret < 0) {
       ldout(s->cct, 1) << "failed to auto-generate unique topic '" << unique_topic_name << 
         "', ret=" << op_ret << dendl;

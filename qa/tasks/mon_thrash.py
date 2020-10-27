@@ -3,13 +3,13 @@ Monitor thrash
 """
 import logging
 import contextlib
-import ceph_manager
 import random
 import time
 import gevent
 import json
 import math
 from teuthology import misc as teuthology
+from tasks import ceph_manager
 from tasks.cephfs.filesystem import MDSCluster
 from tasks.thrasher import Thrasher
 
@@ -85,8 +85,8 @@ class MonitorThrasher(Thrasher):
           all:
             - mon/workloadgen.sh
     """
-    def __init__(self, ctx, manager, config, logger):
-        Thrasher.__init__(self, "MonitorThrasher")
+    def __init__(self, ctx, manager, config, name, logger):
+        super(MonitorThrasher, self).__init__()
 
         self.ctx = ctx
         self.manager = manager
@@ -95,6 +95,7 @@ class MonitorThrasher(Thrasher):
         self.stopping = False
         self.logger = logger
         self.config = config
+        self.name = name
 
         if self.config is None:
             self.config = dict()
@@ -231,7 +232,7 @@ class MonitorThrasher(Thrasher):
             self._do_thrash()
         except Exception as e:
             # See _run exception comment for MDSThrasher
-            self.exception = e
+            self.set_thrasher_exception(e)
             self.logger.exception("exception:")
             # Allow successful completion so gevent doesn't see an exception.
             # The DaemonWatchdog will observe the error and tear down the test.
@@ -328,9 +329,9 @@ class MonitorThrasher(Thrasher):
             if self.scrub:
                 self.log('triggering scrub')
                 try:
-                    self.manager.raw_cluster_cmd('scrub')
-                except Exception:
-                    log.exception("Saw exception while triggering scrub")
+                    self.manager.raw_cluster_cmd('mon', 'scrub')
+                except Exception as e:
+                    log.warning("Ignoring exception while triggering scrub: %s", e)
 
             if self.thrash_delay > 0.0:
                 self.log('waiting for {delay} secs before continuing thrashing'.format(
@@ -372,7 +373,7 @@ def task(ctx, config):
         logger=log.getChild('ceph_manager'),
         )
     thrash_proc = MonitorThrasher(ctx,
-        manager, config,
+        manager, config, "MonitorThrasher",
         logger=log.getChild('mon_thrasher'))
     ctx.ceph[config['cluster']].thrashers.append(thrash_proc)
     try:

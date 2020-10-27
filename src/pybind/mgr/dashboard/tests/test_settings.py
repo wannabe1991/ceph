@@ -3,10 +3,11 @@ from __future__ import absolute_import
 
 import errno
 import unittest
-from . import KVStoreMockMixin, ControllerTestCase
+
 from .. import settings
 from ..controllers.settings import Settings as SettingsController
 from ..settings import Settings, handle_option_command
+from . import ControllerTestCase, KVStoreMockMixin  # pylint: disable=no-name-in-module
 
 
 class SettingsTest(unittest.TestCase, KVStoreMockMixin):
@@ -103,7 +104,19 @@ class SettingsControllerTest(ControllerTestCase, KVStoreMockMixin):
         SettingsController._cp_config['tools.authenticate.on'] = False
         cls.setup_controllers([SettingsController])
 
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # pylint: disable=protected-access
+        settings.Options.GRAFANA_API_HOST = ('localhost', str)
+        settings.Options.GRAFANA_ENABLED = (False, bool)
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+
     def setUp(self):
+        super().setUp()
         self.mock_kv_store()
 
     def test_settings_list(self):
@@ -115,6 +128,15 @@ class SettingsControllerTest(ControllerTestCase, KVStoreMockMixin):
         self.assertIn('type', data[0].keys())
         self.assertIn('name', data[0].keys())
         self.assertIn('value', data[0].keys())
+
+    def test_settings_list_filtered(self):
+        self._get('/api/settings?names=GRAFANA_ENABLED,PWD_POLICY_ENABLED')
+        self.assertStatus(200)
+        data = self.json_body()
+        self.assertTrue(len(data) == 2)
+        names = [option['name'] for option in data]
+        self.assertIn('GRAFANA_ENABLED', names)
+        self.assertIn('PWD_POLICY_ENABLED', names)
 
     def test_rgw_daemon_get(self):
         self._get('/api/settings/grafana-api-username')

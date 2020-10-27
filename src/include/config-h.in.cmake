@@ -75,6 +75,12 @@
 /* Defined if you have libaio */
 #cmakedefine HAVE_LIBAIO
 
+/* Defined if you have libzbd */
+#cmakedefine HAVE_LIBZBD
+
+/* Defined if you have liburing */
+#cmakedefine HAVE_LIBURING
+
 /* Defind if you have POSIX AIO */
 #cmakedefine HAVE_POSIXAIO
 
@@ -83,6 +89,12 @@
 
 /* Define if you have fuse */
 #cmakedefine HAVE_LIBFUSE
+
+/* Define version major */
+#define CEPH_FUSE_MAJOR_VERSION @FUSE_MAJOR_VERSION@
+
+/* Define version minor */
+#define CEPH_FUSE_MINOR_VERSION @FUSE_MINOR_VERSION@
 
 /* Define to 1 if you have libxfs */
 #cmakedefine HAVE_LIBXFS 1
@@ -193,9 +205,6 @@
 /* Define to 1 if you have fdatasync. */
 #cmakedefine HAVE_FDATASYNC 1
 
-/* Defined if you have librocksdb enabled */
-#cmakedefine HAVE_LIBROCKSDB
-
 /* Define to 1 if you have the <valgrind/helgrind.h> header file. */
 #cmakedefine HAVE_VALGRIND_HELGRIND_H 1
 
@@ -210,6 +219,9 @@
 
 /* Define to 1 if you have sched.h. */
 #cmakedefine HAVE_SCHED 1
+
+/* Define to 1 if you have sigdescr_np. */
+#cmakedefine HAVE_SIGDESCR_NP 1
 
 /* Support SSE (Streaming SIMD Extensions) instructions */
 #cmakedefine HAVE_SSE
@@ -234,6 +246,9 @@
 
 /* yasm can also build the isa-l */
 #cmakedefine HAVE_BETTER_YASM_ELF64
+
+/* Define if isa-l is compiled for arm64 */
+#cmakedefine HAVE_ARMV8_SIMD
 
 /* Define to 1 if strerror_r returns char *. */
 #cmakedefine STRERROR_R_CHAR_P 1
@@ -303,14 +318,14 @@
 
 #cmakedefine MGR_PYTHON_EXECUTABLE "@MGR_PYTHON_EXECUTABLE@"
 
+/* the default value of "mgr_disabled_module" option */
+#cmakedefine MGR_DISABLED_MODULES "@MGR_DISABLED_MODULES@"
+
 /* Define to 1 if you have the `getprogname' function. */
 #cmakedefine HAVE_GETPROGNAME 1
 
 /* Defined if getentropy() is available */
 #cmakedefine HAVE_GETENTROPY
-
-/* Defined if boost::context is available */
-#cmakedefine HAVE_BOOST_CONTEXT
 
 /* Defined if libradosstriper is enabled: */
 #cmakedefine WITH_LIBRADOSSTRIPER
@@ -320,6 +335,9 @@
 
 /* Defined if rabbitmq-c is available for rgw amqp push endpoint */
 #cmakedefine WITH_RADOSGW_AMQP_ENDPOINT
+
+/* Defined if libedkafka is available for rgw kafka push endpoint */
+#cmakedefine WITH_RADOSGW_KAFKA_ENDPOINT
 
 /* Defined if std::map::merge() is supported */
 #cmakedefine HAVE_STDLIB_MAP_SPLICING
@@ -332,5 +350,14 @@
 
 /* Define if unit tests are built. */
 #cmakedefine UNIT_TESTS_BUILT
+
+/* Define if RWL is enabled */
+#cmakedefine WITH_RBD_RWL
+
+/* Shared library extension, such as .so, .dll or .dylib */
+#cmakedefine CMAKE_SHARED_LIBRARY_SUFFIX "@CMAKE_SHARED_LIBRARY_SUFFIX@"
+
+/* libexec directory path */
+#cmakedefine CMAKE_INSTALL_LIBEXECDIR "@CMAKE_INSTALL_LIBEXECDIR@"
 
 #endif /* CONFIG_H */

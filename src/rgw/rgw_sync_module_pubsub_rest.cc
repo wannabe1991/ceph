@@ -14,6 +14,7 @@
 #include "rgw_arn.h"
 #include "rgw_zone.h"
 #include "services/svc_zone.h"
+#include "rgw_sal_rados.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
@@ -23,9 +24,14 @@ class RGWPSCreateTopic_ObjStore : public RGWPSCreateTopicOp {
 public:
   int get_params() override {
     
-    topic_name = s->object.name;
+    topic_name = s->object->get_name();
 
+    opaque_data = s->info.args.get("OpaqueData");
     dest.push_endpoint = s->info.args.get("push-endpoint");
+    
+    if (!validate_and_update_endpoint_secret(dest, s->cct, *(s->info.env))) {
+      return -EINVAL;
+    }
     dest.push_endpoint_args = s->info.args.get_str();
     // dest object only stores endpoint info
     // bucket to store events/records will be set only when subscription is created
@@ -35,7 +41,7 @@ public:
     // the topic ARN will be sent in the reply
     const rgw::ARN arn(rgw::Partition::aws, rgw::Service::sns, 
         store->svc()->zone->get_zonegroup().get_name(),
-        s->user->user_id.tenant, topic_name);
+        s->user->get_tenant(), topic_name);
     topic_arn = arn.to_string();
     return 0;
   }
@@ -82,7 +88,7 @@ public:
 class RGWPSGetTopic_ObjStore : public RGWPSGetTopicOp {
 public:
   int get_params() override {
-    topic_name = s->object.name;
+    topic_name = s->object->get_name();
     return 0;
   }
 
@@ -106,7 +112,7 @@ public:
 class RGWPSDeleteTopic_ObjStore : public RGWPSDeleteTopicOp {
 public:
   int get_params() override {
-    topic_name = s->object.name;
+    topic_name = s->object->get_name();
     return 0;
   }
 };
@@ -130,19 +136,19 @@ protected:
     if (s->init_state.url_bucket.empty()) {
       return nullptr;
     }
-    if (s->object.empty()) {
+    if (s->object->empty()) {
       return new RGWPSListTopics_ObjStore();
     }
     return new RGWPSGetTopic_ObjStore();
   }
   RGWOp *op_put() override {
-    if (!s->object.empty()) {
+    if (!s->object->empty()) {
       return new RGWPSCreateTopic_ObjStore();
     }
     return nullptr;
   }
   RGWOp *op_delete() override {
-    if (!s->object.empty()) {
+    if (!s->object->empty()) {
       return new RGWPSDeleteTopic_ObjStore();
     }
     return nullptr;
@@ -156,7 +162,7 @@ public:
 class RGWPSCreateSub_ObjStore : public RGWPSCreateSubOp {
 public:
   int get_params() override {
-    sub_name = s->object.name;
+    sub_name = s->object->get_name();
 
     bool exists;
     topic_name = s->info.args.get("topic", &exists);
@@ -169,9 +175,12 @@ public:
     const auto& conf = psmodule->get_effective_conf();
 
     dest.push_endpoint = s->info.args.get("push-endpoint");
+    if (!validate_and_update_endpoint_secret(dest, s->cct, *(s->info.env))) {
+      return -EINVAL;
+    }
+    dest.push_endpoint_args = s->info.args.get_str();
     dest.bucket_name = string(conf["data_bucket_prefix"]) + s->owner.get_id().to_str() + "-" + topic_name;
     dest.oid_prefix = string(conf["data_oid_prefix"]) + sub_name + "/";
-    dest.push_endpoint_args = s->info.args.get_str();
     dest.arn_topic = topic_name;
 
     return 0;
@@ -182,7 +191,7 @@ public:
 class RGWPSGetSub_ObjStore : public RGWPSGetSubOp {
 public:
   int get_params() override {
-    sub_name = s->object.name;
+    sub_name = s->object->get_name();
     return 0;
   }
   void send_response() override {
@@ -205,7 +214,7 @@ public:
 class RGWPSDeleteSub_ObjStore : public RGWPSDeleteSubOp {
 public:
   int get_params() override {
-    sub_name = s->object.name;
+    sub_name = s->object->get_name();
     topic_name = s->info.args.get("topic");
     return 0;
   }
@@ -217,7 +226,7 @@ public:
   explicit RGWPSAckSubEvent_ObjStore() {}
 
   int get_params() override {
-    sub_name = s->object.name;
+    sub_name = s->object->get_name();
 
     bool exists;
 
@@ -234,7 +243,7 @@ public:
 class RGWPSPullSubEvents_ObjStore : public RGWPSPullSubEventsOp {
 public:
   int get_params() override {
-    sub_name = s->object.name;
+    sub_name = s->object->get_name();
     marker = s->info.args.get("marker");
     const int ret = s->info.args.get_int("max-entries", &max_entries, 
         RGWUserPubSub::Sub::DEFAULT_MAX_EVENTS);
@@ -275,7 +284,7 @@ protected:
     return false;
   }
   RGWOp *op_get() override {
-    if (s->object.empty()) {
+    if (s->object->empty()) {
       return nullptr;
     }
     if (s->info.args.exists("events")) {
@@ -284,13 +293,13 @@ protected:
     return new RGWPSGetSub_ObjStore();
   }
   RGWOp *op_put() override {
-    if (!s->object.empty()) {
+    if (!s->object->empty()) {
       return new RGWPSCreateSub_ObjStore();
     }
     return nullptr;
   }
   RGWOp *op_delete() override {
-    if (!s->object.empty()) {
+    if (!s->object->empty()) {
       return new RGWPSDeleteSub_ObjStore();
     }
     return nullptr;
@@ -355,7 +364,7 @@ private:
       ldout(s->cct, 1) << "invalid event type in list: " << events_str << dendl;
       return -EINVAL;
     }
-    return notif_bucket_path(s->object.name, bucket_name);
+    return notif_bucket_path(s->object->get_name(), bucket_name);
   }
 
 public:
@@ -388,7 +397,7 @@ private:
       ldout(s->cct, 1) << "missing required param 'topic'" << dendl;
       return -EINVAL;
     }
-    return notif_bucket_path(s->object.name, bucket_name);
+    return notif_bucket_path(s->object->get_name(), bucket_name);
   }
 
 public:
@@ -418,7 +427,7 @@ private:
   rgw_pubsub_bucket_topics result;
 
   int get_params() override {
-    return notif_bucket_path(s->object.name, bucket_name);
+    return notif_bucket_path(s->object->get_name(), bucket_name);
   }
 
 public:
@@ -464,19 +473,19 @@ protected:
     return false;
   }
   RGWOp *op_get() override {
-    if (s->object.empty()) {
+    if (s->object->empty()) {
       return nullptr;
     }
     return new RGWPSListNotifs_ObjStore();
   }
   RGWOp *op_put() override {
-    if (!s->object.empty()) {
+    if (!s->object->empty()) {
       return new RGWPSCreateNotif_ObjStore();
     }
     return nullptr;
   }
   RGWOp *op_delete() override {
-    if (!s->object.empty()) {
+    if (!s->object->empty()) {
       return new RGWPSDeleteNotif_ObjStore();
     }
     return nullptr;
@@ -487,11 +496,12 @@ public:
 };
 
 // factory for ceph specific PubSub REST handlers 
-RGWHandler_REST* RGWRESTMgr_PubSub::get_handler(struct req_state* const s,
-                                                     const rgw::auth::StrategyRegistry& auth_registry,
-                                                     const std::string& frontend_prefix)
+RGWHandler_REST* RGWRESTMgr_PubSub::get_handler(rgw::sal::RGWRadosStore *store,
+						struct req_state* const s,
+						const rgw::auth::StrategyRegistry& auth_registry,
+						const std::string& frontend_prefix)
 {
-  if (RGWHandler_REST_S3::init_from_header(s, RGW_FORMAT_JSON, true) < 0) {
+  if (RGWHandler_REST_S3::init_from_header(store, s, RGW_FORMAT_JSON, true) < 0) {
     return nullptr;
   }
  

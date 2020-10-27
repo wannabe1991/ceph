@@ -4,6 +4,8 @@
 #ifndef CEPH_RGW_SWIFT_AUTH_H
 #define CEPH_RGW_SWIFT_AUTH_H
 
+#include "rgw_common.h"
+#include "rgw_user.h"
 #include "rgw_op.h"
 #include "rgw_rest.h"
 #include "rgw_auth.h"
@@ -142,6 +144,16 @@ public:
   }
 };
 
+/* SwiftAnonymous: applier. */
+class SwiftAnonymousApplier : public rgw::auth::LocalApplier {
+  public:
+    SwiftAnonymousApplier(CephContext* const cct,
+                          const RGWUserInfo& user_info)
+      : LocalApplier(cct, user_info, LocalApplier::NO_SUBUSER, boost::none) {
+      };
+    bool is_admin_of(const rgw_user& uid) const {return false;}
+    bool is_owner_of(const rgw_user& uid) const {return uid.id.compare(RGW_USER_ANON_ID) == 0;}
+};
 
 class SwiftAnonymousEngine : public rgw::auth::AnonymousEngine {
   const rgw::auth::TokenExtractor* const extractor;
@@ -152,7 +164,7 @@ class SwiftAnonymousEngine : public rgw::auth::AnonymousEngine {
 
 public:
   SwiftAnonymousEngine(CephContext* const cct,
-                       const rgw::auth::LocalApplier::Factory* const apl_factory,
+                       const SwiftAnonymousApplier::Factory* const apl_factory,
                        const rgw::auth::TokenExtractor* const extractor)
     : AnonymousEngine(cct, apl_factory),
       extractor(extractor) {
@@ -245,7 +257,7 @@ public:
                       static_cast<rgw::auth::TokenExtractor*>(this),
                       static_cast<rgw::auth::LocalApplier::Factory*>(this)),
       anon_engine(cct,
-                  static_cast<rgw::auth::LocalApplier::Factory*>(this),
+                  static_cast<SwiftAnonymousApplier::Factory*>(this),
                   static_cast<rgw::auth::TokenExtractor*>(this)) {
     /* When the constructor's body is being executed, all member engines
      * should be initialized. Thus, we can safely add them. */
@@ -319,7 +331,8 @@ public:
     return this;
   }
 
-  RGWHandler_REST* get_handler(struct req_state*,
+  RGWHandler_REST* get_handler(rgw::sal::RGWRadosStore *store,
+			       struct req_state*,
                                const rgw::auth::StrategyRegistry&,
                                const std::string&) override {
     return new RGWHandler_SWIFT_Auth;

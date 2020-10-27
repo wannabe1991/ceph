@@ -12,6 +12,7 @@
 #include "rgw_multi.h"
 #include "rgw_op.h"
 #include "rgw_sal.h"
+#include "rgw_sal_rados.h"
 
 #include "services/svc_sys_obj.h"
 #include "services/svc_tier_rados.h"
@@ -194,7 +195,7 @@ int list_multipart_parts(rgw::sal::RGWRadosStore *store, struct req_state *s,
 			 int *next_marker, bool *truncated,
 			 bool assume_unsorted)
 {
-  return list_multipart_parts(store, s->bucket_info, s->cct, upload_id,
+  return list_multipart_parts(store, s->bucket->get_info(), s->cct, upload_id,
 			      meta_oid, num_parts, marker, parts,
 			      next_marker, truncated, assume_unsorted);
 }
@@ -213,6 +214,7 @@ int abort_multipart_upload(rgw::sal::RGWRadosStore *store, CephContext *cct,
   bool truncated;
   int marker = 0;
   int ret;
+  uint64_t parts_accounted_size = 0;
 
   do {
     ret = list_multipart_parts(store, bucket_info, cct,
@@ -249,6 +251,7 @@ int abort_multipart_upload(rgw::sal::RGWRadosStore *store, CephContext *cct,
           remove_objs.push_back(key);
         }
       }
+      parts_accounted_size += obj_part.accounted_size;
     }
   } while (truncated);
 
@@ -270,6 +273,9 @@ int abort_multipart_upload(rgw::sal::RGWRadosStore *store, CephContext *cct,
   if (!remove_objs.empty()) {
     del_op.params.remove_objs = &remove_objs;
   }
+  
+  del_op.params.abortmp = true;
+  del_op.params.parts_accounted_size = parts_accounted_size;
 
   // and also remove the metadata obj
   ret = del_op.delete_obj(null_yield);

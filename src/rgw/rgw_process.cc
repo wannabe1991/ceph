@@ -6,7 +6,6 @@
 #include "common/WorkQueue.h"
 #include "include/scope_guard.h"
 
-#include "rgw_rados.h"
 #include "rgw_dmclock_scheduler.h"
 #include "rgw_rest.h"
 #include "rgw_frontend.h"
@@ -16,6 +15,8 @@
 #include "rgw_client_io.h"
 #include "rgw_opa.h"
 #include "rgw_perf_counters.h"
+#include "rgw_lua.h"
+#include "rgw_lua_request.h"
 
 #include "services/svc_zone_utils.h"
 
@@ -48,8 +49,12 @@ auto schedule_request(Scheduler *scheduler, req_state *s, RGWOp *op)
 
   const auto client = op->dmclock_client();
   const auto cost = op->dmclock_cost();
-  ldpp_dout(op,10) << "scheduling with dmclock client=" << static_cast<int>(client)
-		   << " cost=" << cost << dendl;
+  if (s->cct->_conf->subsys.should_gather(ceph_subsys_rgw, 10)) {
+    ldpp_dout(op,10) << "scheduling with "
+		     << s->cct->_conf.get_val<std::string>("rgw_scheduler_type")
+		     << " client=" << static_cast<int>(client)
+		     << " cost=" << cost << dendl;
+  }
   return scheduler->schedule_request(client, {},
                                      req_state::Clock::to_double(s->time),
                                      cost,
@@ -141,7 +146,7 @@ int rgw_process_authenticated(RGWHandler_REST * const handler,
   if (ret < 0) {
     if (s->system_request) {
       dout(2) << "overriding permissions due to system operation" << dendl;
-    } else if (s->auth.identity->is_admin_of(s->user->user_id)) {
+    } else if (s->auth.identity->is_admin_of(s->user->get_id())) {
       dout(2) << "overriding permissions due to admin operation" << dendl;
     } else {
       return ret;
@@ -185,10 +190,11 @@ int process_request(rgw::sal::RGWRadosStore* const store,
 
   RGWEnv& rgw_env = client_io->get_env();
 
-  RGWUserInfo userinfo;
-
-  struct req_state rstate(g_ceph_context, &rgw_env, &userinfo, req->id);
+  struct req_state rstate(g_ceph_context, &rgw_env, req->id);
   struct req_state *s = &rstate;
+
+  std::unique_ptr<rgw::sal::RGWUser> u = store->get_user(rgw_user());
+  s->set_user(u);
 
   RGWObjectCtx rados_ctx(store, s);
   s->obj_ctx = &rados_ctx;
@@ -227,10 +233,24 @@ int process_request(rgw::sal::RGWRadosStore* const store,
   should_log = mgr->get_logging();
 
   ldpp_dout(s, 2) << "getting op " << s->op << dendl;
-  op = handler->get_op(store);
+  op = handler->get_op();
   if (!op) {
     abort_early(s, NULL, -ERR_METHOD_NOT_ALLOWED, handler);
     goto done;
+  }
+  {
+    std::string script;
+    auto rc = rgw::lua::read_script(store, s->bucket_tenant, s->yield, rgw::lua::context::preRequest, script);
+    if (rc == -ENOENT) {
+      // no script, nothing to do
+    } else if (rc < 0) {
+      ldpp_dout(op, 5) << "WARNING: failed to read pre request script. error: " << rc << dendl;
+    } else {
+      rc = rgw::lua::request::execute(store, rest, olog, s, op->name(), script);
+      if (rc < 0) {
+        ldpp_dout(op, 5) << "WARNING: failed to execute pre request script. error: " << rc << dendl;
+      }
+    }
   }
   std::tie(ret,c) = schedule_request(scheduler, s, op);
   if (ret < 0) {
@@ -269,8 +289,8 @@ int process_request(rgw::sal::RGWRadosStore* const store,
       goto done;
     }
 
-    if (s->user->suspended) {
-      dout(10) << "user is suspended, uid=" << s->user->user_id << dendl;
+    if (s->user->get_info().suspended) {
+      dout(10) << "user is suspended, uid=" << s->user->get_id() << dendl;
       abort_early(s, op, -ERR_USER_SUSPENDED, handler);
       goto done;
     }
@@ -286,6 +306,21 @@ int process_request(rgw::sal::RGWRadosStore* const store,
   }
 
 done:
+  if (op) {
+    std::string script;
+    auto rc = rgw::lua::read_script(store, s->bucket_tenant, s->yield, rgw::lua::context::postRequest, script);
+    if (rc == -ENOENT) {
+      // no script, nothing to do
+    } else if (rc < 0) {
+      ldpp_dout(op, 5) << "WARNING: failed to read post request script. error: " << rc << dendl;
+    } else {
+      rc = rgw::lua::request::execute(store, rest, olog, s, op->name(), script);
+      if (rc < 0) {
+        ldpp_dout(op, 5) << "WARNING: failed to execute post request script. error: " << rc << dendl;
+      }
+    }
+  }
+
   try {
     client_io->complete_request();
   } catch (rgw::io::Exception& e) {

@@ -6,13 +6,17 @@
 #include <cstring>
 #include <map>
 
+#include "common/async/context_pool.h"
 #include "common/ceph_context.h"
 #include "common/ceph_argparse.h"
-#include "global/global_init.h"
 #include "common/config.h"
+#include "global/global_init.h"
+
 #include "auth/KeyRing.h"
-#include "mount.ceph.h"
 #include "mon/MonClient.h"
+
+#include "mount.ceph.h"
+
 
 extern "C" void mount_ceph_get_config_info(const char *config_file,
 					   const char *name,
@@ -40,7 +44,8 @@ extern "C" void mount_ceph_get_config_info(const char *config_file,
   conf.parse_env(cct->get_module_type()); // environment variables override
   conf.apply_changes(nullptr);
 
-  MonClient monc = MonClient(cct.get());
+  ceph::async::io_context_pool ioc(1);
+  MonClient monc = MonClient(cct.get(), ioc);
   err = monc.build_initial_monmap();
   if (err)
     goto scrape_keyring;
@@ -71,7 +76,7 @@ extern "C" void mount_ceph_get_config_info(const char *config_file,
   if (monaddrs.length())
     strcpy(cci->cci_mons, monaddrs.c_str());
   else
-    mount_ceph_debug("Could not discover monitor addresses");
+    mount_ceph_debug("Could not discover monitor addresses\n");
 
 scrape_keyring:
   err = keyring.from_ceph_context(cct.get());

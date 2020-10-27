@@ -32,11 +32,11 @@
 #define dout_subsys ceph_subsys_ms
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, this)
-static ostream& _prefix(std::ostream *_dout, AsyncMessenger *m) {
+static std::ostream& _prefix(std::ostream *_dout, AsyncMessenger *m) {
   return *_dout << "-- " << m->get_myaddrs() << " ";
 }
 
-static ostream& _prefix(std::ostream *_dout, Processor *p) {
+static std::ostream& _prefix(std::ostream *_dout, Processor *p) {
   return *_dout << " Processor -- ";
 }
 
@@ -60,7 +60,7 @@ Processor::Processor(AsyncMessenger *r, Worker *w, CephContext *c)
     listen_handler(new C_processor_accept(this)) {}
 
 int Processor::bind(const entity_addrvec_t &bind_addrs,
-		    const set<int>& avoid_ports,
+		    const std::set<int>& avoid_ports,
 		    entity_addrvec_t* bound_addrs)
 {
   const auto& conf = msgr->cct->_conf;
@@ -158,7 +158,9 @@ void Processor::start()
       for (auto& listen_socket : listen_sockets) {
 	if (listen_socket) {
           if (listen_socket.fd() == -1) {
-            ldout(msgr->cct, 1) << __func__ << " Erro: processor restart after listen_socket.fd closed. " << this << dendl;
+            ldout(msgr->cct, 1) << __func__ 
+                << " Error: processor restart after listen_socket.fd closed. " 
+                << this << dendl;
             return;
           }
 	  worker->center.create_file_event(listen_socket.fd(), EVENT_READABLE,
@@ -199,6 +201,7 @@ void Processor::accept()
 	accept_error_num = 0;
 	continue;
       } else {
+	--w->references;
 	if (r == -EINTR) {
 	  continue;
 	} else if (r == -EAGAIN) {
@@ -275,7 +278,7 @@ class C_handle_reap : public EventCallback {
  */
 
 AsyncMessenger::AsyncMessenger(CephContext *cct, entity_name_t name,
-                               const std::string &type, string mname, uint64_t _nonce)
+                               const std::string &type, std::string mname, uint64_t _nonce)
   : SimplePolicyMessenger(cct, name),
     dispatch_queue(cct, this, mname),
     nonce(_nonce)
@@ -311,7 +314,6 @@ AsyncMessenger::~AsyncMessenger()
 {
   delete reap_handler;
   ceph_assert(!did_bind); // either we didn't bind or we shut down the Processor
-  local_connection->mark_down();
   for (auto &&p : processors)
     delete p;
 }
@@ -344,7 +346,8 @@ int AsyncMessenger::shutdown()
     p->stop();
   mark_down_all();
   // break ref cycles on the loopback connection
-  local_connection->set_priv(NULL);
+  local_connection->clear_priv();
+  local_connection->mark_down();
   did_bind = false;
   lock.lock();
   stop_cond.notify_all();
@@ -394,7 +397,7 @@ int AsyncMessenger::bindv(const entity_addrvec_t &bind_addrs)
   lock.unlock();
 
   // bind to a socket
-  set<int> avoid_ports;
+  std::set<int> avoid_ports;
   entity_addrvec_t bound_addrs;
   unsigned i = 0;
   for (auto &&p : processors) {
@@ -418,7 +421,7 @@ int AsyncMessenger::bindv(const entity_addrvec_t &bind_addrs)
   return 0;
 }
 
-int AsyncMessenger::rebind(const set<int>& avoid_ports)
+int AsyncMessenger::rebind(const std::set<int>& avoid_ports)
 {
   ldout(cct,1) << __func__ << " rebind avoid " << avoid_ports << dendl;
   ceph_assert(did_bind);
@@ -434,7 +437,7 @@ int AsyncMessenger::rebind(const set<int>& avoid_ports)
 
   entity_addrvec_t bound_addrs;
   entity_addrvec_t bind_addrs = get_myaddrs();
-  set<int> new_avoid(avoid_ports);
+  std::set<int> new_avoid(avoid_ports);
   for (auto& a : bind_addrs.v) {
     new_avoid.insert(a.get_port());
     a.set_port(0);
@@ -498,6 +501,24 @@ void AsyncMessenger::_finish_bind(const entity_addrvec_t& bind_addrs,
 
   ldout(cct,1) << __func__ << " bind my_addrs is " << get_myaddrs() << dendl;
   did_bind = true;
+}
+
+int AsyncMessenger::client_reset()
+{
+  mark_down_all();
+
+  std::scoped_lock l{lock};
+  // adjust the nonce; we want our entity_addr_t to be truly unique.
+  nonce += 1000000;
+  ldout(cct, 10) << __func__ << " new nonce " << nonce << dendl;
+
+  entity_addrvec_t newaddrs = *my_addrs;
+  for (auto& a : newaddrs.v) {
+    a.set_nonce(nonce);
+  }
+  set_myaddrs(newaddrs);
+  _init_local_connection();
+  return 0;
 }
 
 int AsyncMessenger::start()
@@ -678,19 +699,19 @@ int AsyncMessenger::send_to(Message *m, int type, const entity_addrvec_t& addrs)
 
 ConnectionRef AsyncMessenger::connect_to(int type,
 					 const entity_addrvec_t& addrs,
-					 bool anon)
+					 bool anon, bool not_local_dest)
 {
-  if (*my_addrs == addrs ||
-      (addrs.v.size() == 1 &&
-       my_addrs->contains(addrs.front()))) {
-    // local
-    return local_connection;
+  if (!not_local_dest) {
+    if (*my_addrs == addrs ||
+	(addrs.v.size() == 1 &&
+	 my_addrs->contains(addrs.front()))) {
+      // local
+      return local_connection;
+    }
   }
 
-  std::lock_guard l{lock};
-
   auto av = _filter_addrs(addrs);
-
+  std::lock_guard l{lock};
   if (anon) {
     return create_connect(av, type, anon);
   }
@@ -825,7 +846,8 @@ int AsyncMessenger::accept_conn(const AsyncConnectionRef& conn)
 {
   std::lock_guard l{lock};
   if (conn->policy.server &&
-      conn->policy.lossy) {
+      conn->policy.lossy &&
+      !conn->policy.register_lossy_clients) {
     anon_conns.insert(conn);
     conn->get_perf_counter()->inc(l_msgr_active_connections);
     return 0;

@@ -22,12 +22,6 @@ target_link_libraries(unittest_seastar_messenger crimson)
 add_executable(test_seastar_messenger_peer test_messenger_peer.cc)
 target_link_libraries(test_seastar_messenger_peer ceph-common global ${ALLOC_LIBS})
 
-add_executable(perf_crimson_msgr perf_crimson_msgr.cc)
-target_link_libraries(perf_crimson_msgr crimson)
-
-add_executable(perf_async_msgr perf_async_msgr.cc)
-target_link_libraries(perf_async_msgr ceph-common global ${ALLOC_LIBS})
-
 add_executable(unittest_seastar_echo
   test_alien_echo.cc)
 target_link_libraries(unittest_seastar_echo crimson)
@@ -36,14 +30,19 @@ add_executable(unittest_async_echo
   test_async_echo.cc)
 target_link_libraries(unittest_async_echo ceph-common global)
 
-add_executable(unittest_seastar_thread_pool
-  test_thread_pool.cc)
-add_ceph_test(unittest_seastar_thread_pool
-  unittest_seastar_thread_pool --memory 256M --smp 1)
-target_link_libraries(unittest_seastar_thread_pool crimson)
+add_executable(unittest_seastar_alienstore_thread_pool
+  test_alienstore_thread_pool.cc)
+add_ceph_test(unittest_seastar_alienstore_thread_pool
+  unittest_seastar_alienstore_thread_pool --memory 256M --smp 1)
+target_link_libraries(unittest_seastar_alienstore_thread_pool
+  crimson-os
+  crimson-alienstore
+  crimson)
 
 add_executable(unittest_seastar_config
   test_config.cc)
+add_ceph_test(unittest_seastar_config
+  unittest_seastar_config --memory 256M)
 target_link_libraries(unittest_seastar_config crimson)
 
 add_executable(unittest_seastar_monc
@@ -60,4 +59,22 @@ add_executable(unittest_seastar_lru
   test_lru.cc)
 add_ceph_unittest(unittest_seastar_lru --memory 256M --smp 1)
 target_link_libraries(unittest_seastar_lru crimson GTest::Main)
+
+add_executable(unittest_fixed_kv_node_layout
+  test_fixed_kv_node_layout.cc)
+add_ceph_unittest(unittest_fixed_kv_node_layout)
+target_link_libraries(unittest_seastar_lru crimson GTest::Main)
+
+add_subdirectory(seastore)
+
+add_library(crimson-gtest STATIC
+  gtest_seastar.cc)
+target_link_libraries(crimson-gtest crimson-common GTest::GTest)
+add_library(crimson::gtest ALIAS crimson-gtest)
+
+add_executable(unittest-seastar-errorator
+  test_errorator.cc)
+target_link_libraries(
+  unittest-seastar-errorator
+  crimson::gtest)
 

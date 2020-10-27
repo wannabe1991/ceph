@@ -16,6 +16,32 @@
 #define dout_subsys ceph_subsys_mon
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, mon)
+
+using std::dec;
+using std::hex;
+using std::list;
+using std::map;
+using std::make_pair;
+using std::ostream;
+using std::ostringstream;
+using std::pair;
+using std::set;
+using std::string;
+using std::stringstream;
+using std::to_string;
+using std::vector;
+
+using ceph::bufferlist;
+using ceph::decode;
+using ceph::encode;
+using ceph::ErasureCodeInterfaceRef;
+using ceph::ErasureCodeProfile;
+using ceph::Formatter;
+using ceph::JSONFormatter;
+using ceph::make_message;
+using ceph::mono_clock;
+using ceph::mono_time;
+
 static ostream& _prefix(std::ostream *_dout, Monitor *mon) {
   return *_dout << "mon." << mon->name << "@" << mon->rank
 		<< "(" << mon->get_state_name()
@@ -60,13 +86,14 @@ void MgrStatMonitor::update_from_paxos(bool *need_bootstrap)
 	       << " " << progress_events.size() << " progress events"
 	       << dendl;
     }
-    catch (buffer::error& e) {
+    catch (ceph::buffer::error& e) {
       derr << "failed to decode mgrstat state; luminous dev version? "
 	   << e.what() << dendl;
     }
   }
   check_subs();
   update_logger();
+  mon->osdmon()->notify_new_pg_digest();
 }
 
 void MgrStatMonitor::update_logger()
@@ -279,11 +306,18 @@ bool MgrStatMonitor::preprocess_statfs(MonOpRequestRef op)
             << " != " << mon->monmap->fsid << dendl;
     return true;
   }
+  const auto& pool = statfs->data_pool;
+  if (pool && !mon->osdmon()->osdmap.have_pg_pool(*pool)) {
+    // There's no error field for MStatfsReply so just ignore the request.
+    // This is known to happen when a client is still accessing a removed fs.
+    dout(1) << __func__ << " on removed pool " << *pool << dendl;
+    return true;
+  }
   dout(10) << __func__ << " " << *statfs
            << " from " << statfs->get_orig_source() << dendl;
   epoch_t ver = get_last_committed();
   auto reply = new MStatfsReply(statfs->fsid, statfs->get_tid(), ver);
-  reply->h.st = get_statfs(mon->osdmon()->osdmap, statfs->data_pool);
+  reply->h.st = get_statfs(mon->osdmon()->osdmap, pool);
   mon->send_reply(op, reply);
   return true;
 }

@@ -17,7 +17,8 @@
 #include <seastar/core/future.hh>
 
 #include "Fwd.h"
-#include "crimson/thread/Throttle.h"
+#include "crimson/common/throttle.h"
+#include "crimson/net/chained_dispatchers.h"
 #include "msg/Message.h"
 #include "msg/Policy.h"
 
@@ -34,7 +35,7 @@ namespace crimson::net {
 class Interceptor;
 #endif
 
-using Throttle = crimson::thread::Throttle;
+using Throttle = crimson::common::Throttle;
 using SocketPolicy = ceph::net::Policy<Throttle>;
 
 class Messenger {
@@ -72,17 +73,28 @@ public:
                                      uint32_t min_port, uint32_t max_port) = 0;
 
   /// start the messenger
-  virtual seastar::future<> start(Dispatcher *dispatcher) = 0;
+  virtual seastar::future<> start(ChainedDispatchersRef) = 0;
 
   /// either return an existing connection to the peer,
   /// or a new pending connection
-  virtual seastar::future<ConnectionXRef>
+  virtual ConnectionRef
   connect(const entity_addr_t& peer_addr,
-          const entity_type_t& peer_type) = 0;
+          const entity_name_t& peer_name) = 0;
+
+  ConnectionRef
+  connect(const entity_addr_t& peer_addr,
+          const entity_type_t& peer_type) {
+    return connect(peer_addr, entity_name_t(peer_type, -1));
+  }
 
   // wait for messenger shutdown
   virtual seastar::future<> wait() = 0;
 
+  virtual void add_dispatcher(Dispatcher&) = 0;
+
+  virtual void remove_dispatcher(Dispatcher&) = 0;
+
+  virtual bool dispatcher_chain_empty() const = 0;
   /// stop listenening and wait for all connections to close. safe to destruct
   /// after this future becomes available
   virtual seastar::future<> shutdown() = 0;
@@ -106,11 +118,6 @@ public:
     auth_server = as;
   }
 
-  // get the local messenger shard if it is accessed by another core
-  virtual Messenger* get_local_shard() {
-    return this;
-  }
-
   virtual void print(ostream& out) const = 0;
 
   virtual SocketPolicy get_policy(entity_type_t peer_type) const = 0;
@@ -131,11 +138,10 @@ public:
   void set_require_authorizer(bool r) {
     require_authorizer = r;
   }
-  static seastar::future<Messenger*>
+  static MessengerRef
   create(const entity_name_t& name,
          const std::string& lname,
-         const uint64_t nonce,
-         const int master_sid=-1);
+         const uint64_t nonce);
 };
 
 inline ostream& operator<<(ostream& out, const Messenger& msgr) {

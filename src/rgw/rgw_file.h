@@ -8,6 +8,7 @@
 
 /* internal header */
 #include <string.h>
+#include <string_view>
 #include <sys/stat.h>
 #include <stdint.h>
 
@@ -23,7 +24,6 @@
 #include <boost/range/adaptor/reversed.hpp>
 #include <boost/container/flat_map.hpp>
 #include <boost/variant.hpp>
-#include <boost/utility/string_ref.hpp>
 #include <boost/optional.hpp>
 #include "xxhash.h"
 #include "include/buffer.h"
@@ -216,7 +216,7 @@ namespace rgw {
       struct timespec mtime;
       struct timespec atime;
       uint32_t version;
-      State() : dev(0), size(0), nlink(1), owner_uid(0), owner_gid(0),
+      State() : dev(0), size(0), nlink(1), owner_uid(0), owner_gid(0), unix_mode(0),
 		ctime{0,0}, mtime{0,0}, atime{0,0}, version(0) {}
     } state;
 
@@ -268,6 +268,7 @@ namespace rgw {
     static constexpr uint32_t FLAG_STATELESS_OPEN = 0x0400;
     static constexpr uint32_t FLAG_EXACT_MATCH = 0x0800;
     static constexpr uint32_t FLAG_MOUNT = 0x1000;
+    static constexpr uint32_t FLAG_IN_CB = 0x2000;
 
 #define CREATE_FLAGS(x) \
     ((x) & ~(RGWFileHandle::FLAG_CREATE|RGWFileHandle::FLAG_LOCK))
@@ -438,6 +439,8 @@ namespace rgw {
 
     int stat(struct stat* st, uint32_t flags = FLAG_NONE) {
       /* partial Unix attrs */
+      /* FIPS zeroization audit 20191115: this memset is not security
+       * related. */
       memset(st, 0, sizeof(struct stat));
       st->st_dev = state.dev;
       st->st_ino = fh.fh_hk.object; // XXX
@@ -508,7 +511,8 @@ namespace rgw {
 	if (pos > 1) {
 	  path += "/";
 	} else {
-	  if (!omit_bucket && (path.front() != '/')) // pretty-print
+	  if (!omit_bucket &&
+	      ((path.length() == 0) || (path.front() != '/')))
 	    path += "/";
 	}
 	path += *s;
@@ -718,7 +722,7 @@ namespace rgw {
 
     void invalidate();
 
-    bool reclaim() override;
+    bool reclaim(const cohort::lru::ObjectFactory* newobj_fac) override;
 
     typedef cohort::lru::LRU<std::mutex> FhLRU;
 
@@ -1314,10 +1318,10 @@ public:
   uint32_t d_count;
   bool rcb_eof; // caller forced early stop in readdir cycle
 
-  RGWListBucketsRequest(CephContext* _cct, RGWUserInfo *_user,
+  RGWListBucketsRequest(CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
 			RGWFileHandle* _rgw_fh, rgw_readdir_cb _rcb,
 			void* _cb_arg, RGWFileHandle::readdir_offset& _offset)
-    : RGWLibRequest(_cct, _user), rgw_fh(_rgw_fh), offset(_offset),
+    : RGWLibRequest(_cct, std::move(_user)), rgw_fh(_rgw_fh), offset(_offset),
       cb_arg(_cb_arg), rcb(_rcb), ioff(nullptr), ix(0), d_count(0),
       rcb_eof(false) {
 
@@ -1352,20 +1356,16 @@ public:
   }
 
   int header_init() override {
-    struct req_state* s = get_state();
-    s->info.method = "GET";
-    s->op = OP_GET;
+    struct req_state* state = get_state();
+    state->info.method = "GET";
+    state->op = OP_GET;
 
     /* XXX derp derp derp */
-    s->relative_uri = "/";
-    s->info.request_uri = "/"; // XXX
-    s->info.effective_uri = "/";
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
-
-    // woo
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
+    state->relative_uri = "/";
+    state->info.request_uri = "/"; // XXX
+    state->info.effective_uri = "/";
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 
     return 0;
   }
@@ -1382,10 +1382,10 @@ public:
   void send_response_data(rgw::sal::RGWBucketList& buckets) override {
     if (!sent_data)
       return;
-    map<string, rgw::sal::RGWSalBucket*>& m = buckets.get_buckets();
+    auto& m = buckets.get_buckets();
     for (const auto& iter : m) {
-      boost::string_ref marker{iter.first};
-      rgw::sal::RGWSalBucket* ent = iter.second;
+      std::string_view marker{iter.first};
+      auto& ent = iter.second;
       if (! this->operator()(ent->get_name(), marker)) {
 	/* caller cannot accept more */
 	lsubdout(cct, rgw, 5) << "ListBuckets rcb failed"
@@ -1403,8 +1403,8 @@ public:
     // do nothing
   }
 
-  int operator()(const boost::string_ref& name,
-		 const boost::string_ref& marker) {
+  int operator()(const std::string_view& name,
+		 const std::string_view& marker) {
     uint64_t off = XXH64(name.data(), name.length(), fh_key::seed);
     if (!! ioff) {
       *ioff = off;
@@ -1448,10 +1448,10 @@ public:
   uint32_t d_count;
   bool rcb_eof; // caller forced early stop in readdir cycle
 
-  RGWReaddirRequest(CephContext* _cct, RGWUserInfo *_user,
+  RGWReaddirRequest(CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
 		    RGWFileHandle* _rgw_fh, rgw_readdir_cb _rcb,
 		    void* _cb_arg, RGWFileHandle::readdir_offset& _offset)
-    : RGWLibRequest(_cct, _user), rgw_fh(_rgw_fh), offset(_offset),
+    : RGWLibRequest(_cct, std::move(_user)), rgw_fh(_rgw_fh), offset(_offset),
       cb_arg(_cb_arg), rcb(_rcb), ioff(nullptr), ix(0), d_count(0),
       rcb_eof(false) {
 
@@ -1492,21 +1492,17 @@ public:
   }
 
   int header_init() override {
-    struct req_state* s = get_state();
-    s->info.method = "GET";
-    s->op = OP_GET;
+    struct req_state* state = get_state();
+    state->info.method = "GET";
+    state->op = OP_GET;
 
     /* XXX derp derp derp */
     std::string uri = "/" + rgw_fh->bucket_name() + "/";
-    s->relative_uri = uri;
-    s->info.request_uri = uri; // XXX
-    s->info.effective_uri = uri;
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
-
-    // woo
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
+    state->relative_uri = uri;
+    state->info.request_uri = uri; // XXX
+    state->info.effective_uri = uri;
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 
     prefix = rgw_fh->relative_object_name();
     if (prefix.length() > 0)
@@ -1516,7 +1512,7 @@ public:
     return 0;
   }
 
-  int operator()(const boost::string_ref name, const rgw_obj_key& marker,
+  int operator()(const std::string_view name, const rgw_obj_key& marker,
 		 const ceph::real_time& t, const uint64_t fsz, uint8_t type) {
 
     assert(name.length() > 0); // all cases handled in callers
@@ -1556,10 +1552,10 @@ public:
   }
 
   void send_response() override {
-    struct req_state* s = get_state();
+    struct req_state* state = get_state();
     for (const auto& iter : objs) {
 
-      boost::string_ref sref {iter.key.name};
+      std::string_view sref {iter.key.name};
 
       lsubdout(cct, rgw, 15) << "readdir objects prefix: " << prefix
 			     << " obj: " << sref << dendl;
@@ -1574,7 +1570,7 @@ public:
 
       lsubdout(cct, rgw, 15) << "RGWReaddirRequest "
 			     << __func__ << " "
-			     << "list uri=" << s->relative_uri << " "
+			     << "list uri=" << state->relative_uri << " "
 			     << " prefix=" << prefix << " "
 			     << " obj path=" << iter.key.name
 			     << " (" << sref << ")" << ""
@@ -1614,7 +1610,7 @@ public:
       if (iter.first.back() == '/')
 	const_cast<std::string&>(iter.first).pop_back();
 
-      boost::string_ref sref{iter.first};
+      std::string_view sref{iter.first};
 
       size_t last_del = sref.find_last_of('/');
       if (last_del != string::npos)
@@ -1622,7 +1618,7 @@ public:
 
       lsubdout(cct, rgw, 15) << "RGWReaddirRequest "
 			     << __func__ << " "
-			     << "list uri=" << s->relative_uri << " "
+			     << "list uri=" << state->relative_uri << " "
 			     << " prefix=" << prefix << " "
 			     << " cpref=" << sref
 			     << dendl;
@@ -1679,9 +1675,9 @@ public:
   bool valid;
   bool has_children;
 
-  RGWRMdirCheck (CephContext* _cct, RGWUserInfo *_user,
+  RGWRMdirCheck (CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
 		 const RGWFileHandle* _rgw_fh)
-    : RGWLibRequest(_cct, _user), rgw_fh(_rgw_fh), valid(false),
+    : RGWLibRequest(_cct, std::move(_user)), rgw_fh(_rgw_fh), valid(false),
       has_children(false) {
     default_max = 2;
     op = this;
@@ -1701,19 +1697,16 @@ public:
   }
 
   int header_init() override {
-    struct req_state* s = get_state();
-    s->info.method = "GET";
-    s->op = OP_GET;
+    struct req_state* state = get_state();
+    state->info.method = "GET";
+    state->op = OP_GET;
 
     std::string uri = "/" + rgw_fh->bucket_name() + "/";
-    s->relative_uri = uri;
-    s->info.request_uri = uri;
-    s->info.effective_uri = uri;
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
-
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
+    state->relative_uri = uri;
+    state->info.request_uri = uri;
+    state->info.effective_uri = uri;
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 
     prefix = rgw_fh->relative_object_name();
     if (prefix.length() > 0)
@@ -1761,9 +1754,9 @@ class RGWCreateBucketRequest : public RGWLibRequest,
 public:
   const std::string& bucket_name;
 
-  RGWCreateBucketRequest(CephContext* _cct, RGWUserInfo *_user,
+  RGWCreateBucketRequest(CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
 			std::string& _bname)
-    : RGWLibRequest(_cct, _user), bucket_name(_bname) {
+    : RGWLibRequest(_cct, std::move(_user)), bucket_name(_bname) {
     op = this;
   }
 
@@ -1787,30 +1780,26 @@ public:
 
   int header_init() override {
 
-    struct req_state* s = get_state();
-    s->info.method = "PUT";
-    s->op = OP_PUT;
+    struct req_state* state = get_state();
+    state->info.method = "PUT";
+    state->op = OP_PUT;
 
     string uri = "/" + bucket_name;
     /* XXX derp derp derp */
-    s->relative_uri = uri;
-    s->info.request_uri = uri; // XXX
-    s->info.effective_uri = uri;
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
-
-    // woo
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
+    state->relative_uri = uri;
+    state->info.request_uri = uri; // XXX
+    state->info.effective_uri = uri;
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 
     return 0;
   }
 
   int get_params() override {
-    struct req_state* s = get_state();
-    RGWAccessControlPolicy_S3 s3policy(s->cct);
+    struct req_state* state = get_state();
+    RGWAccessControlPolicy_S3 s3policy(state->cct);
     /* we don't have (any) headers, so just create canned ACLs */
-    int ret = s3policy.create_canned(s->owner, s->bucket_owner, s->canned_acl);
+    int ret = s3policy.create_canned(state->owner, state->bucket_owner, state->canned_acl);
     policy = s3policy;
     return ret;
   }
@@ -1830,9 +1819,9 @@ class RGWDeleteBucketRequest : public RGWLibRequest,
 public:
   const std::string& bucket_name;
 
-  RGWDeleteBucketRequest(CephContext* _cct, RGWUserInfo *_user,
+  RGWDeleteBucketRequest(CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
 			std::string& _bname)
-    : RGWLibRequest(_cct, _user), bucket_name(_bname) {
+    : RGWLibRequest(_cct, std::move(_user)), bucket_name(_bname) {
     op = this;
   }
 
@@ -1851,21 +1840,17 @@ public:
 
   int header_init() override {
 
-    struct req_state* s = get_state();
-    s->info.method = "DELETE";
-    s->op = OP_DELETE;
+    struct req_state* state = get_state();
+    state->info.method = "DELETE";
+    state->op = OP_DELETE;
 
     string uri = "/" + bucket_name;
     /* XXX derp derp derp */
-    s->relative_uri = uri;
-    s->info.request_uri = uri; // XXX
-    s->info.effective_uri = uri;
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
-
-    // woo
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
+    state->relative_uri = uri;
+    state->info.request_uri = uri; // XXX
+    state->info.effective_uri = uri;
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 
     return 0;
   }
@@ -1886,10 +1871,10 @@ public:
   buffer::list& bl; /* XXX */
   size_t bytes_written;
 
-  RGWPutObjRequest(CephContext* _cct, RGWUserInfo *_user,
+  RGWPutObjRequest(CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
 		  const std::string& _bname, const std::string& _oname,
 		  buffer::list& _bl)
-    : RGWLibRequest(_cct, _user), bucket_name(_bname), obj_name(_oname),
+    : RGWLibRequest(_cct, std::move(_user)), bucket_name(_bname), obj_name(_oname),
       bl(_bl), bytes_written(0) {
     op = this;
   }
@@ -1914,40 +1899,36 @@ public:
 
   int header_init() override {
 
-    struct req_state* s = get_state();
-    s->info.method = "PUT";
-    s->op = OP_PUT;
+    struct req_state* state = get_state();
+    state->info.method = "PUT";
+    state->op = OP_PUT;
 
     /* XXX derp derp derp */
     std::string uri = make_uri(bucket_name, obj_name);
-    s->relative_uri = uri;
-    s->info.request_uri = uri; // XXX
-    s->info.effective_uri = uri;
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
+    state->relative_uri = uri;
+    state->info.request_uri = uri; // XXX
+    state->info.effective_uri = uri;
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 
     /* XXX required in RGWOp::execute() */
-    s->content_length = bl.length();
-
-    // woo
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
+    state->content_length = bl.length();
 
     return 0;
   }
 
   int get_params() override {
-    struct req_state* s = get_state();
-    RGWAccessControlPolicy_S3 s3policy(s->cct);
+    struct req_state* state = get_state();
+    RGWAccessControlPolicy_S3 s3policy(state->cct);
     /* we don't have (any) headers, so just create canned ACLs */
-    int ret = s3policy.create_canned(s->owner, s->bucket_owner, s->canned_acl);
+    int ret = s3policy.create_canned(state->owner, state->bucket_owner, state->canned_acl);
     policy = s3policy;
     return ret;
   }
 
   int get_data(buffer::list& _bl) override {
     /* XXX for now, use sharing semantics */
-    _bl.claim(bl);
+    _bl = std::move(bl);
     uint32_t len = _bl.length();
     bytes_written += len;
     return len;
@@ -1982,10 +1963,10 @@ public:
   size_t read_resid; /* initialize to len, <= sizeof(ulp_buffer) */
   bool do_hexdump = false;
 
-  RGWReadRequest(CephContext* _cct, RGWUserInfo *_user,
+  RGWReadRequest(CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
 		 RGWFileHandle* _rgw_fh, uint64_t off, uint64_t len,
 		 void *_ulp_buffer)
-    : RGWLibRequest(_cct, _user), rgw_fh(_rgw_fh), ulp_buffer(_ulp_buffer),
+    : RGWLibRequest(_cct, std::move(_user)), rgw_fh(_rgw_fh), ulp_buffer(_ulp_buffer),
       nread(0), read_resid(len) {
     op = this;
 
@@ -2012,21 +1993,17 @@ public:
 
   int header_init() override {
 
-    struct req_state* s = get_state();
-    s->info.method = "GET";
-    s->op = OP_GET;
+    struct req_state* state = get_state();
+    state->info.method = "GET";
+    state->op = OP_GET;
 
     /* XXX derp derp derp */
-    s->relative_uri = make_uri(rgw_fh->bucket_name(),
+    state->relative_uri = make_uri(rgw_fh->bucket_name(),
 			       rgw_fh->relative_object_name());
-    s->info.request_uri = s->relative_uri; // XXX
-    s->info.effective_uri = s->relative_uri;
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
-
-    // woo
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
+    state->info.request_uri = state->relative_uri; // XXX
+    state->info.effective_uri = state->relative_uri;
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 
     return 0;
   }
@@ -2077,9 +2054,9 @@ public:
   const std::string& bucket_name;
   const std::string& obj_name;
 
-  RGWDeleteObjRequest(CephContext* _cct, RGWUserInfo *_user,
+  RGWDeleteObjRequest(CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
 		      const std::string& _bname, const std::string& _oname)
-    : RGWLibRequest(_cct, _user), bucket_name(_bname), obj_name(_oname) {
+    : RGWLibRequest(_cct, std::move(_user)), bucket_name(_bname), obj_name(_oname) {
     op = this;
   }
 
@@ -2098,21 +2075,17 @@ public:
 
   int header_init() override {
 
-    struct req_state* s = get_state();
-    s->info.method = "DELETE";
-    s->op = OP_DELETE;
+    struct req_state* state = get_state();
+    state->info.method = "DELETE";
+    state->op = OP_DELETE;
 
     /* XXX derp derp derp */
     std::string uri = make_uri(bucket_name, obj_name);
-    s->relative_uri = uri;
-    s->info.request_uri = uri; // XXX
-    s->info.effective_uri = uri;
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
-
-    // woo
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
+    state->relative_uri = uri;
+    state->info.request_uri = uri; // XXX
+    state->info.effective_uri = uri;
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 
     return 0;
   }
@@ -2132,10 +2105,10 @@ public:
 
   static constexpr uint32_t FLAG_NONE = 0x000;
 
-  RGWStatObjRequest(CephContext* _cct, RGWUserInfo *_user,
+  RGWStatObjRequest(CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
 		    const std::string& _bname, const std::string& _oname,
 		    uint32_t _flags)
-    : RGWLibRequest(_cct, _user), bucket_name(_bname), obj_name(_oname),
+    : RGWLibRequest(_cct, std::move(_user)), bucket_name(_bname), obj_name(_oname),
       _size(0), flags(_flags) {
     op = this;
 
@@ -2180,20 +2153,16 @@ public:
 
   int header_init() override {
 
-    struct req_state* s = get_state();
-    s->info.method = "GET";
-    s->op = OP_GET;
+    struct req_state* state = get_state();
+    state->info.method = "GET";
+    state->op = OP_GET;
 
     /* XXX derp derp derp */
-    s->relative_uri = make_uri(bucket_name, obj_name);
-    s->info.request_uri = s->relative_uri; // XXX
-    s->info.effective_uri = s->relative_uri;
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
-
-    // woo
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
+    state->relative_uri = make_uri(bucket_name, obj_name);
+    state->info.request_uri = state->relative_uri; // XXX
+    state->info.effective_uri = state->relative_uri;
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 
     return 0;
   }
@@ -2229,10 +2198,10 @@ public:
   std::map<std::string, buffer::list> attrs;
   RGWLibFS::BucketStats& bs;
 
-  RGWStatBucketRequest(CephContext* _cct, RGWUserInfo *_user,
+  RGWStatBucketRequest(CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
 		       const std::string& _path,
 		       RGWLibFS::BucketStats& _stats)
-    : RGWLibRequest(_cct, _user), bs(_stats) {
+    : RGWLibRequest(_cct, std::move(_user)), bs(_stats) {
     uri = "/" + _path;
     op = this;
   }
@@ -2261,20 +2230,16 @@ public:
 
   int header_init() override {
 
-    struct req_state* s = get_state();
-    s->info.method = "GET";
-    s->op = OP_GET;
+    struct req_state* state = get_state();
+    state->info.method = "GET";
+    state->op = OP_GET;
 
     /* XXX derp derp derp */
-    s->relative_uri = uri;
-    s->info.request_uri = uri; // XXX
-    s->info.effective_uri = uri;
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
-
-    // woo
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
+    state->relative_uri = uri;
+    state->info.request_uri = uri; // XXX
+    state->info.effective_uri = uri;
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 
     return 0;
   }
@@ -2284,7 +2249,7 @@ public:
   }
 
   void send_response() override {
-    bucket->get_creation_time() = get_state()->bucket_info.creation_time;
+    bucket->get_creation_time() = get_state()->bucket->get_info().creation_time;
     bs.size = bucket->get_size();
     bs.size_rounded = bucket->get_size_rounded();
     bs.creation_time = bucket->get_creation_time();
@@ -2308,9 +2273,9 @@ public:
   bool is_dir;
   bool exact_matched;
 
-  RGWStatLeafRequest(CephContext* _cct, RGWUserInfo *_user,
+  RGWStatLeafRequest(CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
 		     RGWFileHandle* _rgw_fh, const std::string& _path)
-    : RGWLibRequest(_cct, _user), rgw_fh(_rgw_fh), path(_path),
+    : RGWLibRequest(_cct, std::move(_user)), rgw_fh(_rgw_fh), path(_path),
       matched(false), is_dir(false), exact_matched(false) {
     default_max = 1000; // logical max {"foo", "foo/"}
     op = this;
@@ -2331,21 +2296,17 @@ public:
 
   int header_init() override {
 
-    struct req_state* s = get_state();
-    s->info.method = "GET";
-    s->op = OP_GET;
+    struct req_state* state = get_state();
+    state->info.method = "GET";
+    state->op = OP_GET;
 
     /* XXX derp derp derp */
     std::string uri = "/" + rgw_fh->bucket_name() + "/";
-    s->relative_uri = uri;
-    s->info.request_uri = uri; // XXX
-    s->info.effective_uri = uri;
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
-
-    // woo
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
+    state->relative_uri = uri;
+    state->info.request_uri = uri; // XXX
+    state->info.effective_uri = uri;
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 
     prefix = rgw_fh->relative_object_name();
     if (prefix.length() > 0)
@@ -2362,39 +2323,41 @@ public:
   }
 
   void send_response() override {
-    struct req_state* s = get_state();
+    struct req_state* state = get_state();
     // try objects
     for (const auto& iter : objs) {
       auto& name = iter.key.name;
       lsubdout(cct, rgw, 15) << "RGWStatLeafRequest "
 			     << __func__ << " "
-			     << "list uri=" << s->relative_uri << " "
+			     << "list uri=" << state->relative_uri << " "
 			     << " prefix=" << prefix << " "
 			     << " obj path=" << name << ""
 			     << " target = " << path << ""
 			     << dendl;
       /* XXX is there a missing match-dir case (trailing '/')? */
       matched = true;
-      if (name == path)
+      if (name == path) {
 	exact_matched = true;
-      return;
+        return;
+      }
     }
     // try prefixes
     for (auto& iter : common_prefixes) {
       auto& name = iter.first;
       lsubdout(cct, rgw, 15) << "RGWStatLeafRequest "
 			     << __func__ << " "
-			     << "list uri=" << s->relative_uri << " "
+			     << "list uri=" << state->relative_uri << " "
 			     << " prefix=" << prefix << " "
 			     << " pref path=" << name << " (not chomped)"
 			     << " target = " << path << ""
 			     << dendl;
       matched = true;
       /* match-dir case (trailing '/') */
-      if (name == prefix + "/")
+      if (name == prefix + "/") {
 	exact_matched = true;
-      is_dir = true;
-      break;
+        is_dir = true;
+        return;
+      }
     }
   }
 
@@ -2426,16 +2389,18 @@ public:
   size_t bytes_written;
   bool eio;
 
-  RGWWriteRequest(CephContext* _cct, RGWUserInfo *_user, RGWFileHandle* _fh,
-		  const std::string& _bname, const std::string& _oname)
-    : RGWLibContinuedReq(_cct, _user),
+  RGWWriteRequest(rgw::sal::RGWRadosStore* store, std::unique_ptr<rgw::sal::RGWUser> _user,
+		  RGWFileHandle* _fh, const std::string& _bname, const std::string& _oname)
+    : RGWLibContinuedReq(store->ctx(), std::move(_user)),
       bucket_name(_bname), obj_name(_oname),
-      rgw_fh(_fh), filter(nullptr), real_ofs(0),
+      rgw_fh(_fh), filter(nullptr), timer_id(0), real_ofs(0),
       bytes_written(0), eio(false) {
 
-    int ret = header_init();
+    // in ctr this is not a virtual call
+    // invoking this classes's header_init()
+    int ret = RGWWriteRequest::header_init();
     if (ret == 0) {
-      ret = init_from_header(get_state());
+      ret = init_from_header(store, get_state());
     }
     op = this;
   }
@@ -2455,30 +2420,26 @@ public:
 
   int header_init() override {
 
-    struct req_state* s = get_state();
-    s->info.method = "PUT";
-    s->op = OP_PUT;
+    struct req_state* state = get_state();
+    state->info.method = "PUT";
+    state->op = OP_PUT;
 
     /* XXX derp derp derp */
     std::string uri = make_uri(bucket_name, obj_name);
-    s->relative_uri = uri;
-    s->info.request_uri = uri; // XXX
-    s->info.effective_uri = uri;
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
-
-    // woo
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
+    state->relative_uri = uri;
+    state->info.request_uri = uri; // XXX
+    state->info.effective_uri = uri;
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 
     return 0;
   }
 
   int get_params() override {
-    struct req_state* s = get_state();
-    RGWAccessControlPolicy_S3 s3policy(s->cct);
+    struct req_state* state = get_state();
+    RGWAccessControlPolicy_S3 s3policy(state->cct);
     /* we don't have (any) headers, so just create canned ACLs */
-    int ret = s3policy.create_canned(s->owner, s->bucket_owner, s->canned_acl);
+    int ret = s3policy.create_canned(state->owner, state->bucket_owner, state->canned_acl);
     policy = s3policy;
     return ret;
   }
@@ -2486,7 +2447,7 @@ public:
   int get_data(buffer::list& _bl) override {
     /* XXX for now, use sharing semantics */
     uint32_t len = data.length();
-    _bl.claim(data);
+    _bl = std::move(data);
     bytes_written += len;
     return len;
   }
@@ -2495,7 +2456,7 @@ public:
     if (off != real_ofs) {
       eio = true;
     }
-    data.claim(_bl);
+    data = std::move(_bl);
     real_ofs += data.length();
     ofs = off; /* consumed in exec_continue() */
   }
@@ -2523,16 +2484,16 @@ public:
   const std::string& src_name;
   const std::string& dst_name;
 
-  RGWCopyObjRequest(CephContext* _cct, RGWUserInfo *_user,
+  RGWCopyObjRequest(CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
 		    RGWFileHandle* _src_parent, RGWFileHandle* _dst_parent,
 		    const std::string& _src_name, const std::string& _dst_name)
-    : RGWLibRequest(_cct, _user), src_parent(_src_parent),
+    : RGWLibRequest(_cct, std::move(_user)), src_parent(_src_parent),
       dst_parent(_dst_parent), src_name(_src_name), dst_name(_dst_name) {
     /* all requests have this */
     op = this;
 
     /* allow this request to replace selected attrs */
-    attrs_mod = RGWRados::ATTRSMOD_MERGE;
+    attrs_mod = rgw::sal::ATTRSMOD_MERGE;
   }
 
   bool only_bucket() override { return true; }
@@ -2551,42 +2512,38 @@ public:
 
   int header_init() override {
 
-    struct req_state* s = get_state();
-    s->info.method = "PUT"; // XXX check
-    s->op = OP_PUT;
+    struct req_state* state = get_state();
+    state->info.method = "PUT"; // XXX check
+    state->op = OP_PUT;
 
     src_bucket_name = src_parent->bucket_name();
     // need s->src_bucket_name?
-    src_object.name = src_parent->format_child_name(src_name, false);
+    src_object->set_name(src_parent->format_child_name(src_name, false));
     // need s->src_object?
 
     dest_bucket_name = dst_parent->bucket_name();
     // need s->bucket.name?
-    dest_object = dst_parent->format_child_name(dst_name, false);
+    dest_obj_name = dst_parent->format_child_name(dst_name, false);
     // need s->object_name?
 
-    int rc = valid_s3_object_name(dest_object);
+    int rc = valid_s3_object_name(dest_obj_name);
     if (rc != 0)
       return rc;
 
     /* XXX and fixup key attr (could optimize w/string ref and
-     * dest_object) */
+     * dest_obj_name) */
     buffer::list ux_key;
     fh_key fhk = dst_parent->make_fhk(dst_name);
     rgw::encode(fhk, ux_key);
     emplace_attr(RGW_ATTR_UNIX_KEY1, std::move(ux_key));
 
 #if 0 /* XXX needed? */
-    s->relative_uri = uri;
-    s->info.request_uri = uri; // XXX
-    s->info.effective_uri = uri;
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
+    state->relative_uri = uri;
+    state->info.request_uri = uri; // XXX
+    state->info.effective_uri = uri;
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 #endif
-
-    // woo
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
 
     return 0;
   }
@@ -2612,9 +2569,9 @@ public:
   const std::string& bucket_name;
   const std::string& obj_name;
 
-  RGWSetAttrsRequest(CephContext* _cct, RGWUserInfo *_user,
+  RGWSetAttrsRequest(CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
 		     const std::string& _bname, const std::string& _oname)
-    : RGWLibRequest(_cct, _user), bucket_name(_bname), obj_name(_oname) {
+    : RGWLibRequest(_cct, std::move(_user)), bucket_name(_bname), obj_name(_oname) {
     op = this;
   }
 
@@ -2633,21 +2590,17 @@ public:
 
   int header_init() override {
 
-    struct req_state* s = get_state();
-    s->info.method = "PUT";
-    s->op = OP_PUT;
+    struct req_state* state = get_state();
+    state->info.method = "PUT";
+    state->op = OP_PUT;
 
     /* XXX derp derp derp */
     std::string uri = make_uri(bucket_name, obj_name);
-    s->relative_uri = uri;
-    s->info.request_uri = uri; // XXX
-    s->info.effective_uri = uri;
-    s->info.request_params = "";
-    s->info.domain = ""; /* XXX ? */
-
-    // woo
-    s->user = user;
-    s->bucket_tenant = user->user_id.tenant;
+    state->relative_uri = uri;
+    state->info.request_uri = uri; // XXX
+    state->info.effective_uri = uri;
+    state->info.request_params = "";
+    state->info.domain = ""; /* XXX ? */
 
     return 0;
   }
@@ -2667,9 +2620,9 @@ class RGWGetClusterStatReq : public RGWLibRequest,
         public RGWGetClusterStat {
 public:
   struct rados_cluster_stat_t& stats_req;
-  RGWGetClusterStatReq(CephContext* _cct,RGWUserInfo *_user,
+  RGWGetClusterStatReq(CephContext* _cct, std::unique_ptr<rgw::sal::RGWUser> _user,
                        rados_cluster_stat_t& _stats):
-  RGWLibRequest(_cct, _user), stats_req(_stats){
+  RGWLibRequest(_cct, std::move(_user)), stats_req(_stats){
     op = this;
   }
 
@@ -2685,10 +2638,9 @@ public:
   }
 
   int header_init() override {
-    struct req_state* s = get_state();
-    s->info.method = "GET";
-    s->op = OP_GET;
-    s->user = user;
+    struct req_state* state = get_state();
+    state->info.method = "GET";
+    state->op = OP_GET;
     return 0;
   }
 

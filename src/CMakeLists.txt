@@ -1,7 +1,6 @@
 include(GetGitRevisionDescription)
 include(CheckCXXCompilerFlag)
 
-include(GNUInstallDirs)
 # for erasure and compressor plugins
 set(CEPH_INSTALL_PKGLIBDIR ${CMAKE_INSTALL_LIBDIR}/${PROJECT_NAME})
 set(CEPH_INSTALL_FULL_PKGLIBDIR ${CMAKE_INSTALL_FULL_LIBDIR}/${PROJECT_NAME})
@@ -23,32 +22,54 @@ set(pkgdatadir ${CMAKE_INSTALL_FULL_DATADIR})
 set(datadir ${CEPH_INSTALL_DATADIR})
 set(prefix ${CMAKE_INSTALL_PREFIX})
 
-add_definitions("-DHAVE_CONFIG_H -D__CEPH__ -D_REENTRANT -D_THREAD_SAFE -D__STDC_FORMAT_MACROS")
-add_definitions("-D_FILE_OFFSET_BITS=64")
+add_definitions(
+  -DHAVE_CONFIG_H
+  -D__CEPH__
+  -D_REENTRANT
+  -D_THREAD_SAFE
+  -D__STDC_FORMAT_MACROS
+  -D_FILE_OFFSET_BITS=64)
 if(LINUX)
   add_definitions("-D_GNU_SOURCE")
 endif()
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wtype-limits -Wignored-qualifiers -Winit-self")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wpointer-arith -Werror=format-security -fno-strict-aliasing -fsigned-char")
+add_compile_options(
+  -Wall
+  -fno-strict-aliasing
+  -fsigned-char)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ftemplate-depth-1024")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wnon-virtual-dtor")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unknown-pragmas")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-ignored-qualifiers")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-unknown-pragmas")
+if(NOT MSVC)
+  add_compile_options(
+    -Wtype-limits
+    -Wignored-qualifiers
+    -Wpointer-arith
+    -Werror=format-security
+    -Winit-self
+    -Wno-unknown-pragmas)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-ignored-qualifiers>)
+endif()
+
+add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ftemplate-depth-1024>)
+
 CHECK_CXX_COMPILER_FLAG("-Wpessimizing-move" COMPILER_SUPPORTS_PESSIMIZING_MOVE)
 if(COMPILER_SUPPORTS_PESSIMIZING_MOVE)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wpessimizing-move")
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wpessimizing-move>)
 endif()
 CHECK_CXX_COMPILER_FLAG("-Wredundant-move" COMPILER_SUPPORTS_REDUNDANT_MOVE)
 if(COMPILER_SUPPORTS_REDUNDANT_MOVE)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wredundant-move")
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wredundant-move>)
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -rdynamic")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wstrict-null-sentinel -Woverloaded-virtual")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-new-ttp-matching")
+  if(MINGW)
+    # The MINGW headers are missing some "const" qualifiers.
+    add_compile_options($<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-fpermissive>)
+  else()
+    string(APPEND CMAKE_EXE_LINKER_FLAGS " -rdynamic")
+  endif()
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wstrict-null-sentinel>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Woverloaded-virtual>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-new-ttp-matching>)
   # cmake does not add '-pie' for executables even if
   # CMAKE_POSITION_INDEPENDENT_CODE is TRUE.
   if(EXE_LINKER_USE_PIE)
@@ -58,20 +79,28 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
   endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL Clang)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_EXPORTS_C_FLAG}")
-  set(CMAKE_LINKER_FLAGS "${CMAKE_LINKER_FLAGS} -rdynamic -export-dynamic ${CMAKE_EXE_EXPORTS_C_FLAG}")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-inconsistent-missing-override -Wno-mismatched-tags")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-private-field")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-address-of-packed-member")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-unused-function")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-unused-local-typedef")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-varargs")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-gnu-designator")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-missing-braces -Wno-parentheses -Wno-deprecated-register")
+  string(APPEND CMAKE_LINKER_FLAGS " -rdynamic -export-dynamic ${CMAKE_EXE_EXPORTS_C_FLAG}")
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-inconsistent-missing-override>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-mismatched-tags>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-private-field>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-address-of-packed-member>)
+  add_compile_options(
+    -Wno-unused-function
+    -Wno-unused-local-typedef
+    -Wno-varargs
+    -Wno-gnu-designator
+    -Wno-missing-braces
+    -Wno-parentheses
+    -Wno-deprecated-register)
+  if(FREEBSD)
+    # Need to use the GNU binutils linker to get versioning right.
+    string(APPEND CMAKE_EXE_LINKER_FLAGS " -fuse-ld=/usr/local/bin/ld -Wno-unused-command-line-argument")
+    string(APPEND CMAKE_SHARED_LINKER_FLAGS " -fuse-ld=/usr/local/bin/ld -Wno-unused-command-line-argument")
+  endif()
   if(APPLE)
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -undefined dynamic_lookup")
+    string(APPEND CMAKE_SHARED_LINKER_FLAGS " -undefined dynamic_lookup")
   endif()
 endif(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
-set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} ${CMAKE_CXX_FLAGS}")
 
 if(NOT CMAKE_BUILD_TYPE)
   if(EXISTS "${CMAKE_SOURCE_DIR}/.git")
@@ -84,7 +113,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if(WITH_CEPH_DEBUG_MUTEX OR CMAKE_BUILD_TYPE STREQUAL Debug)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DCEPH_DEBUG_MUTEX")
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-DCEPH_DEBUG_MUTEX>)
 endif()
 
 include(CheckCCompilerFlag)
@@ -92,16 +121,21 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
   CHECK_C_COMPILER_FLAG("-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2" HAS_FORTIFY_SOURCE)
   if(NOT CMAKE_BUILD_TYPE STREQUAL Debug)
     if(HAS_FORTIFY_SOURCE)
-      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2")
-      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2")
+      add_definitions(
+        -U_FORTIFY_SOURCE
+        -D_FORTIFY_SOURCE=2)
     endif()
   endif()
   CHECK_C_COMPILER_FLAG(-fstack-protector-strong HAS_STACK_PROTECT)
   if (HAS_STACK_PROTECT)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fstack-protector-strong")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fstack-protector-strong")
+    add_compile_options(-fstack-protector-strong)
   endif()
 endif(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
+
+CHECK_C_COMPILER_FLAG("-D_GLIBCXX_ASSERTIONS" HAS_GLIBCXX_ASSERTIONS)
+if(HAS_GLIBCXX_ASSERTIONS AND CMAKE_BUILD_TYPE STREQUAL Debug)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-D_GLIBCXX_ASSERTIONS>)
+endif()
 
 include(SIMDExt)
 if(HAVE_INTEL)
@@ -112,12 +146,15 @@ if(HAVE_INTEL)
     set(object_format "elf64")
   endif()
   set(CMAKE_ASM_FLAGS "-f ${object_format}")
-  include(CheckYasm)
-  check_yasm_support(${object_format}
-    HAVE_GOOD_YASM_ELF64
-    HAVE_BETTER_YASM_ELF64)
+  if(NOT WIN32)
+    # The native tools might be located even when cross compiling, which
+    # might not work in this case (especially when targeting Windows).
+    include(CheckYasm)
+    check_yasm_support(${object_format}
+      HAVE_GOOD_YASM_ELF64
+      HAVE_BETTER_YASM_ELF64)
+  endif()
 endif()
-
 
 # require c++17
 set(CMAKE_CXX_STANDARD 17)
@@ -146,13 +183,12 @@ set(DIAGNOSTICS_COLOR "auto"
   CACHE STRING "Used if the C/C++ compiler supports the -fdiagnostics-color option. May have one of three values -- 'auto' (default), 'always', or 'never'. If set to 'always' and the compiler supports the option, 'make [...] | less -R' will make visible diagnostics colorization of compiler output.")
 
 if(COMPILER_SUPPORTS_DIAGNOSTICS_COLOR)
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fdiagnostics-color=${DIAGNOSTICS_COLOR}")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fdiagnostics-color=${DIAGNOSTICS_COLOR}")
+  add_compile_options(-fdiagnostics-color=${DIAGNOSTICS_COLOR})
 endif()
 
 set(EXTRALIBS ${CMAKE_DL_LIBS})
-if(NOT APPLE)
-  list(APPEND EXTRALIBS rt)
+if(HAVE_POSIX_TIMERS)
+  list(APPEND EXTRALIBS ${RT_LIBRARY})
 endif()
 if(LINUX OR APPLE)
   set(LIB_RESOLV resolv)
@@ -163,9 +199,11 @@ if(${ENABLE_COVERAGE})
   find_program(HAVE_GCOV gcov)
   if(NOT HAVE_GCOV)
     message(FATAL_ERROR "Coverage Enabled but gcov Not Found")
-  endif(NOT HAVE_GCOV)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-arcs -ftest-coverage -O0")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-arcs -ftest-coverage")
+  endif()
+  add_compile_options(
+    -fprofile-arcs
+    -ftest-coverage
+    -O0)
   list(APPEND EXTRALIBS gcov)
 endif(${ENABLE_COVERAGE})
 
@@ -176,7 +214,9 @@ set(GCOV_PREFIX_STRIP 4)
 option(ENABLE_GIT_VERSION "build Ceph with git version string" ON)
 if(${ENABLE_GIT_VERSION})
   get_git_head_revision(GIT_REFSPEC CEPH_GIT_VER)
-  git_describe(CEPH_GIT_NICE_VER --always)
+  git_describe(CEPH_GIT_NICE_VER_WITH_V --always)
+  # remove leading 'v'
+  string(SUBSTRING ${CEPH_GIT_NICE_VER_WITH_V} 1 -1 CEPH_GIT_NICE_VER)
   #if building from a source tarball via make-dist
   if(${CEPH_GIT_VER} STREQUAL "GITDIR-NOTFOUND")
     message(STATUS "Ceph/.git directory not found, parsing ${CMAKE_CURRENT_SOURCE_DIR}/.git_version for CEPH_GIT_VER and CEPH_GIT_NICE_VER")
@@ -210,55 +250,25 @@ if(WITH_CEPHFS_JAVA)
   add_subdirectory(java)
 endif()
 
-# Python stuff
-option(WITH_PYTHON2 "build python2 bindings" ON)
-if(WITH_PYTHON2)
-  find_package(Python2 REQUIRED
-    COMPONENTS Interpreter Development)
-endif()
-
-set(WITH_PYTHON3 "OFF" CACHE STRING "build python3 bindings with specified python3 version")
-if(WITH_PYTHON3)
-  if(WITH_PYTHON3 MATCHES "^(1|ON|YES|TRUE|Y)$")
-    set(WITH_PYTHON3 "3")
-  endif()
-  if(NOT WITH_PYTHON3 STREQUAL "3")
-    set(find_python3_exact "EXACT")
-  endif()
-  find_package(Python3 ${WITH_PYTHON3} ${find_python3_exact} REQUIRED
-    COMPONENTS Interpreter Development)
-  unset(find_python3_exact)
-endif()
-
-# the major version of the python bindings as a dependency of other
-# targets
-if(WITH_PYTHON2)
-  set(PY_BINDING_INFIX 2)
-else()
-  set(PY_BINDING_INFIX 3)
-endif()
-# use python2 by default for python bindings, tools and tests, before
-# switching to python3
-# Python_EXECUTABLE` can be set by `find_package(Python ...)` also. and we do
-# call `find_package(Python ...)` in `ceph/CMakeLists.txt`. but we do so before
-# `add_subdirectory(src)` where `Python_EXECUTABLE` is set. so it's safe to
-# use this variable name and call `find_package(Python ...)`.
-if(WITH_PYTHON2)
-  set(Python_EXECUTABLE ${Python2_EXECUTABLE})
-else()
-  set(Python_EXECUTABLE ${Python3_EXECUTABLE})
-endif()
-
 # sort out which allocator to use
 if(ALLOCATOR STREQUAL "tcmalloc")
   set(ALLOC_LIBS gperftools::tcmalloc)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free")
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-builtin-malloc>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-builtin-calloc>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-builtin-realloc>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-builtin-free>)
 elseif(ALLOCATOR STREQUAL "tcmalloc_minimal")
   set(ALLOC_LIBS gperftools::tcmalloc_minimal)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free")
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-builtin-malloc>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-builtin-calloc>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-builtin-realloc>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-builtin-free>)
 elseif(ALLOCATOR STREQUAL "jemalloc")
   set(ALLOC_LIBS JeMalloc::JeMalloc)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free")
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-builtin-malloc>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-builtin-calloc>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-builtin-realloc>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-builtin-free>)
 endif()
 
 if (WITH_BLKIN)
@@ -278,7 +288,8 @@ list(APPEND mds_files
   mds/FSMapUser.cc
   mds/inode_backtrace.cc
   mds/mdstypes.cc
-  mds/flock.cc)
+  mds/flock.cc
+  mds/cephfs_features.cc)
 
 add_subdirectory(json_spirit)
 
@@ -286,10 +297,23 @@ include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/src/xxHash")
 include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/src/rapidjson/include")
 
 find_package(fmt 5.2.1 QUIET)
-if(NOT fmt_FOUND)
+if(fmt_FOUND)
+  include_directories(SYSTEM "${fmt_INCLUDE_DIR}")
+else()
   message(STATUS "Could not find fmt, will build it")
   add_subdirectory(fmt)
+  include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/src/fmt/include")
 endif()
+
+# in osd/PeeringState.h, the number of elements in PeeringState::Active::reactions
+# is now 21 which exceeds the default value of BOOST_MPL_LIMIT_VECTOR_SIZE, which
+# is 20. so we need to override it. see
+# https://www.boost.org/doc/libs/1_74_0/libs/mpl/doc/refmanual/limit-list-size.html
+# link with this library, if your code includes osd/PeeringState.h (indirectly)
+add_library(Boost::MPL INTERFACE IMPORTED)
+set_target_properties(Boost::MPL PROPERTIES
+  INTERFACE_COMPILE_DEFINITIONS
+    "BOOST_MPL_CFG_NO_PREPROCESSED_HEADERS;BOOST_MPL_LIMIT_LIST_SIZE=30")
 
 if(WITH_SEASTAR)
   find_package(c-ares 1.13.0 QUIET)
@@ -303,6 +327,7 @@ if(WITH_SEASTAR)
       _find_package(${ARGV})
     endif()
   endmacro ()
+  set(Seastar_API_LEVEL "5" CACHE STRING "" FORCE)
   set(Seastar_HWLOC OFF CACHE BOOL "" FORCE)
   set(Seastar_STD_OPTIONAL_VARIANT_STRINGVIEW ON CACHE BOOL "" FORCE)
   if(Seastar_DPDK)
@@ -312,7 +337,14 @@ if(WITH_SEASTAR)
       build_dpdk(${CMAKE_BINARY_DIR}/src/dpdk)
     endif()
   endif()
-  set(Seastar_CXX_FLAGS "-Wno-error;-Wno-sign-compare;-Wno-attributes;-Wno-pessimizing-move;-Wno-address-of-packed-member" CACHE STRING "" FORCE)
+  list(APPEND Seastar_CXX_FLAGS
+    "-Wno-error"
+    "-Wno-sign-compare"
+    "-Wno-attributes"
+    "-Wno-pessimizing-move"
+    "-Wno-address-of-packed-member"
+    "-Wno-non-virtual-dtor")
+  set(Seastar_CXX_FLAGS "${Seastar_CXX_FLAGS}" CACHE STRING "" FORCE)
   add_subdirectory(seastar)
   # create the directory so cmake won't complain when looking at the imported
   # target: Seastar exports this directory created at build-time
@@ -323,12 +355,15 @@ endif()
 set(libcommon_files
   ${CMAKE_BINARY_DIR}/src/include/ceph_ver.h
   ceph_ver.c
+  global/global_context.cc
   xxHash/xxhash.c
+  common/error_code.cc
   log/Log.cc
   mon/MonCap.cc
   mon/MonClient.cc
   mon/MonMap.cc
   mon/MonSub.cc
+  mon/error_code.cc
   mgr/MgrClient.cc
   mon/PGMap.cc
   mgr/ServiceMap.cc
@@ -337,10 +372,14 @@ set(libcommon_files
   osd/OSDMap.cc
   osd/OSDMapMapping.cc
   osd/osd_types.cc
+  osd/error_code.cc
   osd/PGPeeringEvent.cc
   osd/OpRequest.cc
+  osd/ClassHandler.cc
+  osd/osd_op_util.cc
   osdc/Striper.cc
   osdc/Objecter.cc
+  osdc/error_code.cc
   librbd/Features.cc
   ${mds_files})
 set_source_files_properties(ceph_ver.c
@@ -363,7 +402,6 @@ set(ceph_common_objs
   $<TARGET_OBJECTS:compressor_objs>
   $<TARGET_OBJECTS:common-objs>
   $<TARGET_OBJECTS:common_mountcephfs_objs>
-  $<TARGET_OBJECTS:global_common_objs>
   $<TARGET_OBJECTS:crush_objs>)
 set(ceph_common_deps
   json_spirit erasure_code arch crc32
@@ -374,7 +412,9 @@ set(ceph_common_deps
   Boost::program_options
   Boost::date_time
   Boost::iostreams
+  fmt::fmt
   StdFilesystem::filesystem
+  fmt::fmt
   ${BLKID_LIBRARIES}
   ${Backtrace_LIBRARIES}
   ${BLKIN_LIBRARIES}
@@ -406,9 +446,19 @@ if(WITH_DPDK)
   list(APPEND ceph_common_deps common_async_dpdk)
 endif()
 
-if(WITH_BLUESTORE_PMEM)
+if(WIN32)
+  list(APPEND ceph_common_deps ws2_32 mswsock iphlpapi bcrypt)
+  list(APPEND ceph_common_deps dlfcn_win32)
+endif()
+
+if(WITH_BLUESTORE_PMEM OR WITH_RBD_RWL)
   if(WITH_SYSTEM_PMDK)
-    find_package(pmem REQUIRED)
+    if(WITH_BLUESTORE_PMEM)
+      find_package(pmem REQUIRED COMPONENTS pmem)
+    endif()
+    if(WITH_RBD_RWL)
+      find_package(pmem REQUIRED COMPONENTS pmemobj)
+    endif()
   else()
     include(Buildpmem)
     build_pmem()
@@ -422,7 +472,7 @@ add_library(ceph-common SHARED ${ceph_common_objs})
 target_link_libraries(ceph-common ${ceph_common_deps})
 # appease dpkg-shlibdeps
 set_target_properties(ceph-common PROPERTIES
-  SOVERSION 0
+  SOVERSION 2
   SKIP_RPATH TRUE)
 if(NOT APPLE AND NOT FREEBSD)
   # Apple uses Mach-O, not ELF. so this option does not apply to APPLE.
@@ -438,11 +488,18 @@ if(NOT APPLE AND NOT FREEBSD)
     PROPERTY LINK_FLAGS "-Wl,-Bsymbolic -Wl,-Bsymbolic-functions")
 endif()
 
-install(
-  TARGETS ceph-common
-  LIBRARY
-  DESTINATION ${CEPH_INSTALL_PKGLIBDIR}
-  NAMELINK_SKIP)
+if(MINGW)
+  install(
+    TARGETS ceph-common
+    RUNTIME
+    DESTINATION ${CEPH_INSTALL_PKGLIBDIR})
+else()
+  install(
+    TARGETS ceph-common
+    LIBRARY
+    DESTINATION ${CEPH_INSTALL_PKGLIBDIR}
+    NAMELINK_SKIP)
+endif()
 
 if(${WITH_LTTNG})
   add_subdirectory(tracing)
@@ -468,6 +525,7 @@ option(WITH_LIBRADOSSTRIPER "build with libradosstriper support" ON)
 
 add_subdirectory(include)
 add_subdirectory(librados)
+add_subdirectory(neorados)
 
 if(WITH_LIBRADOSSTRIPER)
   add_subdirectory(libradosstriper)
@@ -478,7 +536,7 @@ add_subdirectory(mgr)
 set(librados_config_srcs
   librados-config.cc)
 add_executable(librados-config ${librados_config_srcs})
-target_link_libraries(librados-config librados global ${BLKID_LIBRARIES} ${CMAKE_DL_LIBS} ${GSSAPI_LIBRARIES})
+target_link_libraries(librados-config librados Boost::program_options)
 
 install(TARGETS librados-config DESTINATION bin)
 
@@ -491,6 +549,7 @@ endif()
 add_subdirectory(pybind)
 add_subdirectory(ceph-volume)
 add_subdirectory(python-common)
+add_subdirectory(cephadm)
 
 # Monitor
 add_subdirectory(mon)
@@ -520,6 +579,9 @@ endif()
 
 add_subdirectory(kv)
 add_subdirectory(os)
+if(NOT WIN32)
+add_subdirectory(blk)
+endif()
 
 add_subdirectory(osd)
 
@@ -534,7 +596,7 @@ add_dependencies(ceph-osd erasure_code_plugins)
 target_link_libraries(ceph-osd osd os global-static common
   ${BLKID_LIBRARIES})
 if(WITH_FUSE)
-  target_link_libraries(ceph-osd ${FUSE_LIBRARIES})
+  target_link_libraries(ceph-osd FUSE::FUSE)
 endif()
 set_target_properties(ceph-osd PROPERTIES
   POSITION_INDEPENDENT_CODE ${EXE_LINKER_USE_PIE}
@@ -687,10 +749,9 @@ if(WITH_FUSE)
     ceph_fuse.cc
     client/fuse_ll.cc)
   add_executable(ceph-fuse ${ceph_fuse_srcs})
-  target_link_libraries(ceph-fuse ${FUSE_LIBRARIES}
-    ${GSSAPI_LIBRARIES} client ceph-common global-static)
+  target_link_libraries(ceph-fuse FUSE::FUSE
+    ${GSSAPI_LIBRARIES} client ceph-common global-static ${EXTRALIBS})
   set_target_properties(ceph-fuse PROPERTIES
-    COMPILE_FLAGS "-I${FUSE_INCLUDE_DIRS}"
     POSITION_INDEPENDENT_CODE ${EXE_LINKER_USE_PIE})
   install(TARGETS ceph-fuse DESTINATION bin)
   install(PROGRAMS mount.fuse.ceph DESTINATION ${CMAKE_INSTALL_SBINDIR})
@@ -716,6 +777,10 @@ if(WITH_RBD)
     DESTINATION ${CMAKE_INSTALL_BINDIR})
   add_subdirectory(rbd_replay)
 endif(WITH_RBD)
+
+set(SPAWN_BUILD_TESTS OFF CACHE INTERNAL "disable building of spawn unit tests")
+set(SPAWN_INSTALL OFF CACHE INTERNAL "disable installation of spawn headers")
+add_subdirectory(spawn)
 
 # RadosGW
 if(WITH_KVS)
@@ -768,21 +833,21 @@ add_custom_target(vstart-base DEPENDS
     monmaptool
     crushtool
     rados
-    cython${PY_BINDING_INFIX}_rados)
+    cython_rados)
 if (WITH_MGR)
   add_dependencies(vstart-base ceph-mgr)
 endif()
 
 add_custom_target(vstart DEPENDS vstart-base)
-if (WITH_RBD)
-  add_dependencies(vstart cython${PY_BINDING_INFIX}_rbd)
+if(WITH_RBD)
+  add_dependencies(vstart cython_rbd)
 endif()
 if (WITH_CEPHFS)
-  add_dependencies(vstart ceph-mds cephfs cython${PY_BINDING_INFIX}_cephfs)
+  add_dependencies(vstart ceph-mds cephfs cython_cephfs)
 endif()
 if(WITH_RADOSGW)
-  add_dependencies(vstart radosgw radosgw-admin)
-endif(WITH_RADOSGW)
+  add_dependencies(vstart radosgwd radosgw-admin)
+endif()
 
 if(WITH_LTTNG)
   add_dependencies(vstart tracepoint_libraries)
@@ -800,12 +865,13 @@ endif()
 add_custom_target(cephfs_testing DEPENDS
     vstart
     rados
-    cython${PY_BINDING_INFIX}_modules
+    cython_modules
     cephfs
     cls_cephfs
     ceph-fuse
     ceph-dencoder
     cephfs-journal-tool
+    cephfs-meta-injection
     cephfs-data-scan
     cephfs-table-tool)
 
@@ -818,3 +884,64 @@ if (IS_DIRECTORY "${PROJECT_SOURCE_DIR}/.git")
 endif()
 
 add_subdirectory(script)
+
+# add doxygen target
+find_package(Doxygen)
+if(DOXYGEN_FOUND)
+  set(DOXYGEN_FILE_PATTERNS *.cc *.c *.cpp *.C *.cxx *.c++ *.CC *.H *.h *.hh *.hpp)
+  set(DOXYGEN_SOURCE_BROWSER YES)
+  set(DOXYGEN_WARN_IF_UNDOCUMENTED NO)
+  # enabling clang slows down doxygen significantly
+  set(DOXYGEN_CLANG_ASSISTED_PARSING NO)
+  set(DOXYGEN_CLANG_DATABASE_PATH "${PROJECT_BINARY_DIR}")
+  set(DOXYGEN_BUILTIN_STL_SUPPORT YES)
+  set(DOXYGEN_RECURSIVE YES)
+  set(DOXYGEN_QUIET YES)
+  set(DOXYGEN_GENERATE_LATEX NO)
+  set(DOXYGEN_GENERATE_XML NO)
+  set(DOXYGEN_GENERATE_HTML YES)
+  set(DOXYGEN_PROJECT_NAME Ceph)
+  set(DOXYGEN_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/build-doc/doxygen")
+  set(DOXYGEN_STRIP_FROM_PATH "src/")
+  set(DOXYGEN_STRIP_FROM_INC_PATH "src/include")
+  set(DOXYGEN_JAVADOC_AUTOBRIEF YES)
+  set(DOXYGEN_HAVE_DOT NO)
+  set(DOXYGEN_VERBATIM_HEADERS YES)
+  doxygen_add_docs(doxygen
+    auth
+    client
+    cls
+    common
+    compressor
+    crimson
+    crush
+    crypto
+    erasure-code
+    global
+    include
+    journal
+    json_spirit
+    key_value_store
+    kv
+    librados
+    libradosstriper
+    librbd
+    log
+    mds
+    messages
+    mgr
+    mon
+    mount
+    msg
+    objclass
+    objsync
+    os
+    osd
+    osdc
+    perfglue
+    rbd_fuse
+    rbd_replay
+    rgw
+    COMMENT "Generate C++ documentation")
+endif()
+

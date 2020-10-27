@@ -3,19 +3,28 @@
 from __future__ import absolute_import
 
 import json
+import logging
 import threading
 import time
 
 import cherrypy
 from cherrypy._cptools import HandlerWrapperTool
 from cherrypy.test import helper
-
 from mgr_module import CLICommand
+from pyfakefs import fake_filesystem
 
-from .. import logger, mgr
-from ..controllers import json_error_page, generate_controller_routes
+from .. import mgr
+from ..controllers import generate_controller_routes, json_error_page
+from ..plugins import PLUGIN_MANAGER, debug, feature_toggles  # noqa
 from ..services.auth import AuthManagerTool
 from ..services.exception import dashboard_exception_handler
+from ..tools import RequestLoggingTool
+
+PLUGIN_MANAGER.hook.init()
+PLUGIN_MANAGER.hook.register_commands()
+
+
+logger = logging.getLogger('tests')
 
 
 class CmdException(Exception):
@@ -77,6 +86,13 @@ class CLICommandTestMixin(KVStoreMockMixin):
         return exec_dashboard_cmd(None, cmd, **kwargs)
 
 
+class FakeFsMixin(object):
+    fs = fake_filesystem.FakeFilesystem()
+    f_open = fake_filesystem.FakeFileOpen(fs)
+    f_os = fake_filesystem.FakeOsModule(fs)
+    builtins_open = 'builtins.open'
+
+
 class ControllerTestCase(helper.CPWebCase):
     _endpoints_cache = {}
 
@@ -109,7 +125,11 @@ class ControllerTestCase(helper.CPWebCase):
         cherrypy.tree.mount(None, config={
             base_url: {'request.dispatch': mapper}})
 
-    def __init__(self, *args, **kwargs):
+    _request_logging = False
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
         cherrypy.tools.authenticate = AuthManagerTool()
         cherrypy.tools.dashboard_exception_handler = HandlerWrapperTool(dashboard_exception_handler,
                                                                         priority=31)
@@ -118,7 +138,16 @@ class ControllerTestCase(helper.CPWebCase):
             'tools.json_in.on': True,
             'tools.json_in.force': False
         })
-        super(ControllerTestCase, self).__init__(*args, **kwargs)
+        PLUGIN_MANAGER.hook.configure_cherrypy(config=cherrypy.config)
+
+        if cls._request_logging:
+            cherrypy.tools.request_logging = RequestLoggingTool()
+            cherrypy.config.update({'tools.request_logging.on': True})
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._request_logging:
+            cherrypy.config.update({'tools.request_logging.on': False})
 
     def _request(self, url, method, data=None, headers=None):
         if not data:

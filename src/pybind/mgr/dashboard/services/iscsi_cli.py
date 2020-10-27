@@ -6,10 +6,11 @@ import json
 
 from mgr_module import CLIReadCommand, CLIWriteCommand
 
-from .iscsi_client import IscsiClient
-from .iscsi_config import IscsiGatewaysConfig, IscsiGatewayAlreadyExists, InvalidServiceUrl, \
-    ManagedByOrchestratorException, IscsiGatewayDoesNotExist, IscsiGatewayInUse
 from ..rest_client import RequestException
+from .iscsi_client import IscsiClient
+from .iscsi_config import InvalidServiceUrl, IscsiGatewayAlreadyExists, \
+    IscsiGatewayDoesNotExist, IscsiGatewaysConfig, \
+    ManagedByOrchestratorException
 
 
 @CLIReadCommand('dashboard iscsi-gateway-list', desc='List iSCSI gateways')
@@ -18,12 +19,14 @@ def list_iscsi_gateways(_):
 
 
 @CLIWriteCommand('dashboard iscsi-gateway-add',
-                 'name=service_url,type=CephString',
+                 'name=service_url,type=CephString '
+                 'name=name,type=CephString,req=false',
                  'Add iSCSI gateway configuration')
-def add_iscsi_gateway(_, service_url):
+def add_iscsi_gateway(_, service_url, name=None):
     try:
         IscsiGatewaysConfig.validate_service_url(service_url)
-        name = IscsiClient.instance(service_url=service_url).get_hostname()['data']
+        if name is None:
+            name = IscsiClient.instance(service_url=service_url).get_hostname()['data']
         IscsiGatewaysConfig.add_gateway(name, service_url)
         return 0, 'Success', ''
     except IscsiGatewayAlreadyExists as ex:
@@ -41,16 +44,8 @@ def add_iscsi_gateway(_, service_url):
                  'Remove iSCSI gateway configuration')
 def remove_iscsi_gateway(_, name):
     try:
-        try:
-            iscsi_config = IscsiClient.instance(gateway_name=name).get_config()
-            if name in iscsi_config['gateways']:
-                raise IscsiGatewayInUse(name)
-        except RequestException:
-            pass
         IscsiGatewaysConfig.remove_gateway(name)
         return 0, 'Success', ''
-    except IscsiGatewayInUse as ex:
-        return -errno.EBUSY, '', str(ex)
     except IscsiGatewayDoesNotExist as ex:
         return -errno.ENOENT, '', str(ex)
     except ManagedByOrchestratorException as ex:

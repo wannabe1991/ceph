@@ -41,6 +41,7 @@
 #include "messages/MMonJoin.h"
 #include "messages/MMonElection.h"
 #include "messages/MMonSync.h"
+#include "messages/MMonPing.h"
 #include "messages/MMonScrub.h"
 
 #include "messages/MLog.h"
@@ -110,7 +111,6 @@
 #include "messages/MMonGetVersionReply.h"
 #include "messages/MMonHealth.h"
 #include "messages/MMonHealthChecks.h"
-#include "messages/MMonMetadata.h"
 #include "messages/MAuth.h"
 #include "messages/MAuthReply.h"
 #include "messages/MMonSubscribe.h"
@@ -128,8 +128,9 @@
 #include "messages/MClientLease.h"
 #include "messages/MClientSnap.h"
 #include "messages/MClientQuota.h"
+#include "messages/MClientMetrics.h"
 
-#include "messages/MMDSSlaveRequest.h"
+#include "messages/MMDSPeerRequest.h"
 
 #include "messages/MMDSMap.h"
 #include "messages/MFSMap.h"
@@ -174,6 +175,8 @@
 #include "messages/MHeartbeat.h"
 
 #include "messages/MMDSTableRequest.h"
+#include "messages/MMDSMetrics.h"
+#include "messages/MMDSPing.h"
 
 //#include "messages/MInodeUpdate.h"
 #include "messages/MCacheExpire.h"
@@ -210,6 +213,10 @@
 
 #include "messages/MOSDPGUpdateLogMissing.h"
 #include "messages/MOSDPGUpdateLogMissingReply.h"
+
+#ifdef WITH_BLKIN
+#include "Messenger.h"
+#endif
 
 #define DEBUGLVL  10    // debug level of output
 
@@ -288,9 +295,9 @@ void Message::encode(uint64_t features, int crcflags, bool skip_header_crc)
   }
 }
 
-void Message::dump(Formatter *f) const
+void Message::dump(ceph::Formatter *f) const
 {
-  stringstream ss;
+  std::stringstream ss;
   print(ss);
   f->dump_string("summary", ss.str());
 }
@@ -347,11 +354,13 @@ Message *decode_message(CephContext *cct,
   }
 
   // make message
-  ref_t<Message> m;
+  ceph::ref_t<Message> m;
   int type = header.type;
   switch (type) {
 
     // -- with payload --
+
+    using ceph::make_message;
 
   case MSG_PGSTATS:
     m = make_message<MPGStats>();
@@ -405,6 +414,9 @@ Message *decode_message(CephContext *cct,
     break;
   case MSG_MON_SYNC:
     m = make_message<MMonSync>();
+    break;
+  case MSG_MON_PING:
+    m = make_message<MMonPing>();
     break;
   case MSG_MON_SCRUB:
     m = make_message<MMonScrub>();
@@ -463,9 +475,6 @@ Message *decode_message(CephContext *cct,
     break;
   case CEPH_MSG_MON_GET_VERSION_REPLY:
     m = make_message<MMonGetVersionReply>();
-    break;
-  case CEPH_MSG_MON_METADATA:
-    m = make_message<MMonMetadata>();
     break;
 
   case MSG_OSD_BOOT:
@@ -680,10 +689,13 @@ Message *decode_message(CephContext *cct,
   case CEPH_MSG_CLIENT_QUOTA:
     m = make_message<MClientQuota>();
     break;
+  case CEPH_MSG_CLIENT_METRICS:
+    m = make_message<MClientMetrics>();
+    break;
 
     // mds
-  case MSG_MDS_SLAVE_REQUEST:
-    m = make_message<MMDSSlaveRequest>();
+  case MSG_MDS_PEER_REQUEST:
+    m = make_message<MMDSPeerRequest>();
     break;
 
   case CEPH_MSG_MDS_MAP:
@@ -827,6 +839,14 @@ Message *decode_message(CephContext *cct,
     m = make_message<MLock>();
     break;
 
+  case MSG_MDS_METRICS:
+    m = make_message<MMDSMetrics>();
+    break;
+
+  case MSG_MDS_PING:
+    m = make_message<MMDSPing>();
+    break;
+
   case MSG_MGR_BEACON:
     m = make_message<MMgrBeacon>();
     break;
@@ -929,7 +949,7 @@ Message *decode_message(CephContext *cct,
   try {
     m->decode_payload();
   }
-  catch (const buffer::error &e) {
+  catch (const ceph::buffer::error &e) {
     if (cct) {
       lderr(cct) << "failed to decode message of type " << type
 		 << " v" << header.version
@@ -948,7 +968,7 @@ Message *decode_message(CephContext *cct,
   return m.detach();
 }
 
-void Message::encode_trace(bufferlist &bl, uint64_t features) const
+void Message::encode_trace(ceph::bufferlist &bl, uint64_t features) const
 {
   using ceph::encode;
   auto p = trace.get_info();
@@ -959,7 +979,7 @@ void Message::encode_trace(bufferlist &bl, uint64_t features) const
   encode(*p, bl);
 }
 
-void Message::decode_trace(bufferlist::const_iterator &p, bool create)
+void Message::decode_trace(ceph::bufferlist::const_iterator &p, bool create)
 {
   blkin_trace_info info = {};
   decode(info, p);
@@ -971,12 +991,12 @@ void Message::decode_trace(bufferlist::const_iterator &p, bool create)
   const auto msgr = connection->get_messenger();
   const auto endpoint = msgr->get_trace_endpoint();
   if (info.trace_id) {
-    trace.init(get_type_name(), endpoint, &info, true);
+    trace.init(get_type_name().data(), endpoint, &info, true);
     trace.event("decoded trace");
   } else if (create || (msgr->get_myname().is_osd() &&
                         msgr->cct->_conf->osd_blkin_trace_all)) {
     // create a trace even if we didn't get one on the wire
-    trace.init(get_type_name(), endpoint);
+    trace.init(get_type_name().data(), endpoint);
     trace.event("created trace");
   }
   trace.keyval("tid", get_tid());
@@ -992,7 +1012,7 @@ void Message::decode_trace(bufferlist::const_iterator &p, bool create)
 // problems, we currently always encode and decode using the old footer format that doesn't
 // allow for message authentication.  Eventually we should fix that.  PLR
 
-void encode_message(Message *msg, uint64_t features, bufferlist& payload)
+void encode_message(Message *msg, uint64_t features, ceph::bufferlist& payload)
 {
   ceph_msg_footer_old old_footer;
   msg->encode(features, MSG_CRC_ALL);
@@ -1006,6 +1026,7 @@ void encode_message(Message *msg, uint64_t features, bufferlist& payload)
   old_footer.flags = footer.flags;   
   encode(old_footer, payload);
 
+  using ceph::encode;
   encode(msg->get_payload(), payload);
   encode(msg->get_middle(), payload);
   encode(msg->get_data(), payload);
@@ -1016,12 +1037,12 @@ void encode_message(Message *msg, uint64_t features, bufferlist& payload)
 // We've slipped in a 0 signature at this point, so any signature checking after this will
 // fail.  PLR
 
-Message *decode_message(CephContext *cct, int crcflags, bufferlist::const_iterator& p)
+Message *decode_message(CephContext *cct, int crcflags, ceph::bufferlist::const_iterator& p)
 {
   ceph_msg_header h;
   ceph_msg_footer_old fo;
   ceph_msg_footer f;
-  bufferlist fr, mi, da;
+  ceph::bufferlist fr, mi, da;
   decode(h, p);
   decode(fo, p);
   f.front_crc = fo.front_crc;
@@ -1029,6 +1050,7 @@ Message *decode_message(CephContext *cct, int crcflags, bufferlist::const_iterat
   f.data_crc = fo.data_crc;
   f.flags = fo.flags;
   f.sig = 0;
+  using ceph::decode;
   decode(fr, p);
   decode(mi, p);
   decode(da, p);

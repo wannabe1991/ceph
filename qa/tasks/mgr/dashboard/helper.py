@@ -1,28 +1,77 @@
 # -*- coding: utf-8 -*-
-# pylint: disable=W0212,too-many-return-statements
+# pylint: disable=W0212,too-many-return-statements,too-many-public-methods
 from __future__ import absolute_import
 
 import json
 import logging
-from collections import namedtuple
 import time
+from collections import namedtuple
 
 import requests
-import six
-from teuthology.exceptions import CommandFailedError
-
-from ..mgr_test_case import MgrTestCase
-
+from tasks.mgr.mgr_test_case import MgrTestCase
+from teuthology.exceptions import \
+    CommandFailedError  # pylint: disable=import-error
 
 log = logging.getLogger(__name__)
 
 
 class DashboardTestCase(MgrTestCase):
+    # Display full error diffs
+    maxDiff = None
+
+    # Increased x3 (20 -> 60)
+    TIMEOUT_HEALTH_CLEAR = 60
+
     MGRS_REQUIRED = 2
     MDSS_REQUIRED = 1
     REQUIRE_FILESYSTEM = True
     CLIENTS_REQUIRED = 1
     CEPHFS = False
+    ORCHESTRATOR = False
+    ORCHESTRATOR_TEST_DATA = {
+        'inventory': [
+            {
+                'name': 'test-host0',
+                'addr': '1.2.3.4',
+                'devices': [
+                    {
+                        'path': '/dev/sda',
+                    }
+                ]
+            },
+            {
+                'name': 'test-host1',
+                'addr': '1.2.3.5',
+                'devices': [
+                    {
+                        'path': '/dev/sdb',
+                    }
+                ]
+            }
+        ],
+        'daemons': [
+            {
+                'nodename': 'test-host0',
+                'daemon_type': 'mon',
+                'daemon_id': 'a'
+            },
+            {
+                'nodename': 'test-host0',
+                'daemon_type': 'mgr',
+                'daemon_id': 'x'
+            },
+            {
+                'nodename': 'test-host0',
+                'daemon_type': 'osd',
+                'daemon_id': '0'
+            },
+            {
+                'nodename': 'test-host1',
+                'daemon_type': 'osd',
+                'daemon_id': '1'
+            }
+        ]
+    }
 
     _session = None  # type: requests.sessions.Session
     _token = None
@@ -35,7 +84,23 @@ class DashboardTestCase(MgrTestCase):
     AUTH_ROLES = ['administrator']
 
     @classmethod
-    def create_user(cls, username, password, roles):
+    def create_user(cls, username, password, roles=None,
+                    force_password=True, cmd_args=None):
+        # pylint: disable=too-many-arguments
+        """
+        :param username: The name of the user.
+        :type username: str
+        :param password: The password.
+        :type password: str
+        :param roles: A list of roles.
+        :type roles: list
+        :param force_password: Force the use of the specified password. This
+          will bypass the password complexity check. Defaults to 'True'.
+        :type force_password: bool
+        :param cmd_args: Additional command line arguments for the
+          'ac-user-create' command.
+        :type cmd_args: None | list[str]
+        """
         try:
             cls._ceph_cmd(['dashboard', 'ac-user-show', username])
             cls._ceph_cmd(['dashboard', 'ac-user-delete', username])
@@ -43,34 +108,55 @@ class DashboardTestCase(MgrTestCase):
             if ex.exitstatus != 2:
                 raise ex
 
-        cls._ceph_cmd(['dashboard', 'ac-user-create', username, password])
+        user_create_args = [
+            'dashboard', 'ac-user-create', username, password
+        ]
+        if force_password:
+            user_create_args.append('--force-password')
+        if cmd_args:
+            user_create_args.extend(cmd_args)
+        cls._ceph_cmd(user_create_args)
 
-        set_roles_args = ['dashboard', 'ac-user-set-roles', username]
-        for idx, role in enumerate(roles):
-            if isinstance(role, str):
-                set_roles_args.append(role)
-            else:
-                assert isinstance(role, dict)
-                rolename = 'test_role_{}'.format(idx)
-                try:
-                    cls._ceph_cmd(['dashboard', 'ac-role-show', rolename])
-                    cls._ceph_cmd(['dashboard', 'ac-role-delete', rolename])
-                except CommandFailedError as ex:
-                    if ex.exitstatus != 2:
-                        raise ex
-                cls._ceph_cmd(['dashboard', 'ac-role-create', rolename])
-                for mod, perms in role.items():
-                    args = ['dashboard', 'ac-role-add-scope-perms', rolename, mod]
-                    args.extend(perms)
-                    cls._ceph_cmd(args)
-                set_roles_args.append(rolename)
-        cls._ceph_cmd(set_roles_args)
+        if roles:
+            set_roles_args = ['dashboard', 'ac-user-set-roles', username]
+            for idx, role in enumerate(roles):
+                if isinstance(role, str):
+                    set_roles_args.append(role)
+                else:
+                    assert isinstance(role, dict)
+                    rolename = 'test_role_{}'.format(idx)
+                    try:
+                        cls._ceph_cmd(['dashboard', 'ac-role-show', rolename])
+                        cls._ceph_cmd(['dashboard', 'ac-role-delete', rolename])
+                    except CommandFailedError as ex:
+                        if ex.exitstatus != 2:
+                            raise ex
+                    cls._ceph_cmd(['dashboard', 'ac-role-create', rolename])
+                    for mod, perms in role.items():
+                        args = ['dashboard', 'ac-role-add-scope-perms', rolename, mod]
+                        args.extend(perms)
+                        cls._ceph_cmd(args)
+                    set_roles_args.append(rolename)
+            cls._ceph_cmd(set_roles_args)
+
+    @classmethod
+    def create_pool(cls, name, pg_num, pool_type, application='rbd'):
+        data = {
+            'pool': name,
+            'pg_num': pg_num,
+            'pool_type': pool_type,
+            'application_metadata': [application]
+        }
+        if pool_type == 'erasure':
+            data['flags'] = ['ec_overwrites']
+        cls._task_post("/api/pool", data)
 
     @classmethod
     def login(cls, username, password):
         if cls._loggedin:
             cls.logout()
         cls._post('/api/auth', {'username': username, 'password': password})
+        cls._assertEq(cls._resp.status_code, 201)
         cls._token = cls.jsonBody()['token']
         cls._loggedin = True
 
@@ -78,6 +164,7 @@ class DashboardTestCase(MgrTestCase):
     def logout(cls):
         if cls._loggedin:
             cls._post('/api/auth/logout')
+            cls._assertEq(cls._resp.status_code, 200)
             cls._token = None
             cls._loggedin = False
 
@@ -91,16 +178,23 @@ class DashboardTestCase(MgrTestCase):
                 cls._ceph_cmd(['dashboard', 'ac-role-delete', 'test_role_{}'.format(idx)])
 
     @classmethod
-    def RunAs(cls, username, password, roles):
+    def RunAs(cls, username, password, roles=None, force_password=True,
+              cmd_args=None, login=True):
+        # pylint: disable=too-many-arguments
         def wrapper(func):
             def execute(self, *args, **kwargs):
-                self.create_user(username, password, roles)
-                self.login(username, password)
+                self.create_user(username, password, roles,
+                                 force_password, cmd_args)
+                if login:
+                    self.login(username, password)
                 res = func(self, *args, **kwargs)
-                self.logout()
+                if login:
+                    self.logout()
                 self.delete_user(username, roles)
                 return res
+
             return execute
+
         return wrapper
 
     @classmethod
@@ -112,7 +206,7 @@ class DashboardTestCase(MgrTestCase):
         super(DashboardTestCase, cls).setUpClass()
         cls._assign_ports("dashboard", "ssl_server_port")
         cls._load_module("dashboard")
-        cls._base_uri = cls._get_uri("dashboard").rstrip('/')
+        cls.update_base_uri()
 
         if cls.CEPHFS:
             cls.mds_cluster.clear_firewall()
@@ -140,6 +234,17 @@ class DashboardTestCase(MgrTestCase):
             # wait for mds restart to complete...
             cls.fs.wait_for_daemons()
 
+        if cls.ORCHESTRATOR:
+            cls._load_module("test_orchestrator")
+
+            cmd = ['orch', 'set', 'backend', 'test_orchestrator']
+            cls.mgr_cluster.mon_manager.raw_cluster_cmd(*cmd)
+
+            cmd = ['test_orchestrator', 'load_data', '-i', '-']
+            cls.mgr_cluster.mon_manager.raw_cluster_cmd_result(*cmd, stdin=json.dumps(
+                cls.ORCHESTRATOR_TEST_DATA
+            ))
+
         cls._token = None
         cls._session = requests.Session()
         cls._resp = None
@@ -148,10 +253,16 @@ class DashboardTestCase(MgrTestCase):
         if cls.AUTO_AUTHENTICATE:
             cls.login('admin', 'admin')
 
+    @classmethod
+    def update_base_uri(cls):
+        if cls._base_uri is None:
+            cls._base_uri = cls._get_uri("dashboard").rstrip('/')
+
     def setUp(self):
+        super(DashboardTestCase, self).setUp()
         if not self._loggedin and self.AUTO_AUTHENTICATE:
             self.login('admin', 'admin')
-        self.wait_for_health_clear(20)
+        self.wait_for_health_clear(self.TIMEOUT_HEALTH_CLEAR)
 
     @classmethod
     def tearDownClass(cls):
@@ -160,6 +271,7 @@ class DashboardTestCase(MgrTestCase):
     # pylint: disable=inconsistent-return-statements
     @classmethod
     def _request(cls, url, method, data=None, params=None):
+        cls.update_base_uri()
         url = "{}{}".format(cls._base_uri, url)
         log.info("Request %s to %s", method, url)
         headers = {}
@@ -245,7 +357,7 @@ class DashboardTestCase(MgrTestCase):
     @classmethod
     def _task_request(cls, method, url, data, timeout):
         res = cls._request(url, method, data)
-        cls._assertIn(cls._resp.status_code, [200, 201, 202, 204, 400, 403])
+        cls._assertIn(cls._resp.status_code, [200, 201, 202, 204, 400, 403, 404])
 
         if cls._resp.status_code == 403:
             return None
@@ -271,7 +383,7 @@ class DashboardTestCase(MgrTestCase):
             executing_tasks = [task for task in _res['executing_tasks'] if
                                task['metadata'] == task_metadata]
             finished_tasks = [task for task in _res['finished_tasks'] if
-                               task['metadata'] == task_metadata]
+                              task['metadata'] == task_metadata]
             if not executing_tasks and finished_tasks:
                 res_task = finished_tasks[0]
 
@@ -288,12 +400,12 @@ class DashboardTestCase(MgrTestCase):
             elif method == 'DELETE':
                 cls._resp.status_code = 204
             return res_task['ret_value']
+
+        if 'status' in res_task['exception']:
+            cls._resp.status_code = res_task['exception']['status']
         else:
-            if 'status' in res_task['exception']:
-                cls._resp.status_code = res_task['exception']['status']
-            else:
-                cls._resp.status_code = 500
-            return res_task['exception']
+            cls._resp.status_code = 500
+        return res_task['exception']
 
     @classmethod
     def _task_post(cls, url, data=None, timeout=60):
@@ -368,6 +480,12 @@ class DashboardTestCase(MgrTestCase):
         log.info("command result: %s", res)
         return res
 
+    @classmethod
+    def _ceph_cmd_result(cls, cmd):
+        exitstatus = cls.mgr_cluster.mon_manager.raw_cluster_cmd_result(*cmd)
+        log.info("command exit status: %d", exitstatus)
+        return exitstatus
+
     def set_config_key(self, key, value):
         self._ceph_cmd(['config-key', 'set', key, value])
 
@@ -418,16 +536,17 @@ class DashboardTestCase(MgrTestCase):
         return None
 
 
+# TODP: pass defaults=(False,) to namedtuple() if python3.7
 class JLeaf(namedtuple('JLeaf', ['typ', 'none'])):
     def __new__(cls, typ, none=False):
-        if typ == str:
-            typ = six.string_types
-        return super(JLeaf, cls).__new__(cls, typ, none)
+        return super().__new__(cls, typ, none)
 
 
 JList = namedtuple('JList', ['elem_typ'])
 
 JTuple = namedtuple('JList', ['elem_typs'])
+
+JUnion = namedtuple('JUnion', ['elem_typs'])
 
 
 class JObj(namedtuple('JObj', ['sub_elems', 'allow_unknown', 'none', 'unknown_schema'])):
@@ -444,6 +563,42 @@ class JObj(namedtuple('JObj', ['sub_elems', 'allow_unknown', 'none', 'unknown_sc
 
 JAny = namedtuple('JAny', ['none'])
 
+module_options_object_schema = JObj({
+    'name': str,
+    'type': str,
+    'level': str,
+    'flags': int,
+    'default_value': JAny(none=True),
+    'min': JAny(none=False),
+    'max': JAny(none=False),
+    'enum_allowed': JList(str),
+    'see_also': JList(str),
+    'desc': str,
+    'long_desc': str,
+    'tags': JList(str),
+})
+
+module_options_schema = JObj(
+    {},
+    allow_unknown=True,
+    unknown_schema=module_options_object_schema)
+
+addrvec_schema = JList(JObj({
+    'addr': str,
+    'nonce': int,
+    'type': str
+}))
+
+devices_schema = JList(JObj({
+    'daemons': JList(str),
+    'devid': str,
+    'location': JList(JObj({
+        'host': str,
+        'dev': str,
+        'path': str
+    }))
+}))
+
 
 class _ValError(Exception):
     def __init__(self, msg, path):
@@ -451,13 +606,17 @@ class _ValError(Exception):
         super(_ValError, self).__init__('In `input{}`: {}'.format(path_str, msg))
 
 
-# pylint: disable=dangerous-default-value,inconsistent-return-statements
+# pylint: disable=dangerous-default-value,inconsistent-return-statements,too-many-branches
 def _validate_json(val, schema, path=[]):
     """
     >>> d = {'a': 1, 'b': 'x', 'c': range(10)}
     ... ds = JObj({'a': int, 'b': str, 'c': JList(int)})
     ... _validate_json(d, ds)
     True
+    >>> _validate_json({'num': 1}, JObj({'num': JUnion([int,float])}))
+    True
+    >>> _validate_json({'num': 'a'}, JObj({'num': JUnion([int,float])}))
+    False
     """
     if isinstance(schema, JAny):
         if not schema.none and val is None:
@@ -476,10 +635,18 @@ def _validate_json(val, schema, path=[]):
     if isinstance(schema, JTuple):
         return all(_validate_json(val[i], typ, path + [i])
                    for i, typ in enumerate(schema.elem_typs))
+    if isinstance(schema, JUnion):
+        for typ in schema.elem_typs:
+            try:
+                if _validate_json(val, typ, path):
+                    return True
+            except _ValError:
+                pass
+        return False
     if isinstance(schema, JObj):
         if val is None and schema.none:
             return True
-        elif val is None:
+        if val is None:
             raise _ValError('val is None', path)
         if not hasattr(val, 'keys'):
             raise _ValError('val="{}" is not a dict'.format(val), path)
@@ -499,7 +666,7 @@ def _validate_json(val, schema, path=[]):
                 for key in unknown_keys
             )
         return result
-    if schema in [str, int, float, bool, six.string_types]:
+    if schema in [str, int, float, bool]:
         return _validate_json(val, JLeaf(schema), path)
 
     assert False, str(path)

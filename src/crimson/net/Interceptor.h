@@ -59,10 +59,10 @@ class socket_blocker {
   seastar::future<> wait_blocked() {
     ceph_assert(!p_blocked);
     if (p_unblocked) {
-      return seastar::now();
+      return seastar::make_ready_future<>();
     } else {
       p_blocked = seastar::abort_source();
-      return seastar::sleep_abortable(10s, *p_blocked).then([this] {
+      return seastar::sleep_abortable(10s, *p_blocked).then([] {
         throw std::runtime_error(
             "Timeout (10s) in socket_blocker::wait_blocked()");
       }).handle_exception_type([] (const seastar::sleep_aborted& e) {
@@ -78,7 +78,7 @@ class socket_blocker {
     }
     ceph_assert(!p_unblocked);
     p_unblocked = seastar::abort_source();
-    return seastar::sleep_abortable(10s, *p_unblocked).then([this] {
+    return seastar::sleep_abortable(10s, *p_unblocked).then([] {
       ceph_abort("Timeout (10s) in socket_blocker::block()");
     }).handle_exception_type([] (const seastar::sleep_aborted& e) {
       // wait done!

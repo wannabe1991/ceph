@@ -159,7 +159,8 @@ class Module(MgrModule):
         },
         {
             "cmd": "telemetry send "
-                   "name=endpoint,type=CephChoices,strings=ceph|device,n=N,req=false",
+                   "name=endpoint,type=CephChoices,strings=ceph|device,n=N,req=false "
+                   "name=license,type=CephString,req=false",
             "desc": "Force sending data to Ceph telemetry",
             "perm": "rw"
         },
@@ -167,6 +168,16 @@ class Module(MgrModule):
             "cmd": "telemetry show "
                    "name=channels,type=CephString,n=N,req=False",
             "desc": "Show last report or report to be sent",
+            "perm": "r"
+        },
+        {
+            "cmd": "telemetry show-device",
+            "desc": "Show last device report or device report to be sent",
+            "perm": "r"
+        },
+        {
+            "cmd": "telemetry show-all",
+            "desc": "Show report of all channels",
             "perm": "r"
         },
         {
@@ -227,7 +238,11 @@ class Module(MgrModule):
             metadata[key] = defaultdict(int)
 
         for osd in osd_map['osds']:
-            for k, v in self.get_metadata('osd', str(osd['osd'])).items():
+            res = self.get_metadata('osd', str(osd['osd'])).items()
+            if res is None:
+                self.log.debug('Could not get metadata for osd.%s' % str(osd['osd']))
+                continue
+            for k, v in res:
                 if k not in keys:
                     continue
 
@@ -244,7 +259,11 @@ class Module(MgrModule):
             metadata[key] = defaultdict(int)
 
         for mon in mon_map['mons']:
-            for k, v in self.get_metadata('mon', mon['name']).items():
+            res = self.get_metadata('mon', mon['name']).items()
+            if res is None:
+                self.log.debug('Could not get metadata for mon.%s' % (mon['name']))
+                continue
+            for k, v in res:
                 if k not in keys:
                     continue
 
@@ -330,7 +349,8 @@ class Module(MgrModule):
                 continue
             c = json.loads(crashinfo)
             del c['utsname_hostname']
-            (etype, eid) = c.get('entity_name', '').split('.')
+            # entity_name might have more than one '.', beware
+            (etype, eid) = c.get('entity_name', '').split('.', 1)
             m = hashlib.sha1()
             m.update(self.salt.encode('utf-8'))
             m.update(eid.encode('utf-8'))
@@ -378,22 +398,29 @@ class Module(MgrModule):
             if not anon_host:
                 anon_host = str(uuid.uuid1())
                 self.set_store('host-id/%s' % host, anon_host)
+            serial = None
             for dev, rep in m.items():
                 rep['host_id'] = anon_host
+                if serial is None and 'serial_number' in rep:
+                    serial = rep['serial_number']
 
             # anonymize device id
-            (vendor, model, serial) = devid.split('_')
             anon_devid = self.get_store('devid-id/%s' % devid)
             if not anon_devid:
-                anon_devid = '%s_%s_%s' % (vendor, model, uuid.uuid1())
+                # ideally devid is 'vendor_model_serial',
+                # but can also be 'model_serial', 'serial'
+                if '_' in devid:
+                    anon_devid = f"{devid.rsplit('_', 1)[0]}_{uuid.uuid1()}"
+                else:
+                    anon_devid = str(uuid.uuid1())
                 self.set_store('devid-id/%s' % devid, anon_devid)
             self.log.info('devid %s / %s, host %s / %s' % (devid, anon_devid,
                                                            host, anon_host))
 
             # anonymize the smartctl report itself
-            for k in ['serial_number']:
-                if k in m:
-                    m.pop(k)
+            if serial:
+                m_str = json.dumps(m)
+                m = json.loads(m_str.replace(serial, 'deleted'))
 
             if anon_host not in res:
                 res[anon_host] = {}
@@ -511,7 +538,7 @@ class Module(MgrModule):
             for osd in osd_map['osds']:
                 if osd['up'] and not cluster_network:
                     front_ip = osd['public_addrs']['addrvec'][0]['addr'].split(':')[0]
-                    back_ip = osd['public_addrs']['addrvec'][0]['addr'].split(':')[0]
+                    back_ip = osd['cluster_addrs']['addrvec'][0]['addr'].split(':')[0]
                     if front_ip != back_ip:
                         cluster_network = True
             report['osd'] = {
@@ -605,7 +632,7 @@ class Module(MgrModule):
 
             report['usage'] = {
                 'pools': len(df['pools']),
-                'pg_num:': num_pg,
+                'pg_num': num_pg,
                 'total_used_bytes': df['stats']['total_used_bytes'],
                 'total_bytes': df['stats']['total_bytes'],
                 'total_avail_bytes': df['stats']['total_avail_bytes']
@@ -660,41 +687,41 @@ class Module(MgrModule):
 
         return report
 
+    def _try_post(self, what, url, report):
+        self.log.info('Sending %s to: %s' % (what, url))
+        proxies = dict()
+        if self.proxy:
+            self.log.info('Send using HTTP(S) proxy: %s', self.proxy)
+            proxies['http'] = self.proxy
+            proxies['https'] = self.proxy
+        try:
+            resp = requests.put(url=url, json=report, proxies=proxies)
+            resp.raise_for_status()
+        except Exception as e:
+            fail_reason = 'Failed to send %s to %s: %s' % (what, url, str(e))
+            self.log.error(fail_reason)
+            return fail_reason
+        return None
+
     def send(self, report, endpoint=None):
         if not endpoint:
             endpoint = ['ceph', 'device']
         failed = []
         success = []
-        proxies = dict()
         self.log.debug('Send endpoints %s' % endpoint)
-        if self.proxy:
-            self.log.info('Send using HTTP(S) proxy: %s', self.proxy)
-            proxies['http'] = self.proxy
-            proxies['https'] = self.proxy
         for e in endpoint:
             if e == 'ceph':
-                self.log.info('Sending ceph report to: %s', self.url)
-                resp = requests.put(url=self.url, json=report, proxies=proxies)
-                if not resp.ok:
-                    self.log.error("Report send failed: %d %s %s" %
-                                   (resp.status_code, resp.reason, resp.text))
-                    failed.append('Failed to send report to %s: %d %s %s' % (
-                        self.url,
-                        resp.status_code,
-                        resp.reason,
-                        resp.text
-                    ))
+                fail_reason = self._try_post('ceph report', self.url, report)
+                if fail_reason:
+                    failed.append(fail_reason)
                 else:
                     now = int(time.time())
                     self.last_upload = now
                     self.set_store('last_upload', str(now))
                     success.append('Ceph report sent to {0}'.format(self.url))
-                    self.info('Sent report to {0}'.format(self.url))
+                    self.log.info('Sent report to {0}'.format(self.url))
             elif e == 'device':
                 if 'device' in self.get_active_channels():
-                    self.log.info('hi')
-                    self.log.info('Sending device report to: %s',
-                                  self.device_url)
                     devices = self.gather_device_report()
                     num_devs = 0
                     num_hosts = 0
@@ -702,19 +729,10 @@ class Module(MgrModule):
                         self.log.debug('host %s devices %s' % (host, ls))
                         if not len(ls):
                             continue
-                        resp = requests.put(url=self.device_url, json=ls,
-                                            proxies=proxies)
-                        if not resp.ok:
-                            self.log.error(
-                                "Device report failed: %d %s %s" %
-                                (resp.status_code, resp.reason, resp.text))
-                            failed.append(
-                                'Failed to send devices to %s: %d %s %s' % (
-                                    self.device_url,
-                                    resp.status_code,
-                                    resp.reason,
-                                    resp.text
-                                ))
+                        fail_reason = self._try_post('devices', self.device_url,
+                                                     ls)
+                        if fail_reason:
+                            failed.append(fail_reason)
                         else:
                             num_devs += len(ls)
                             num_hosts += 1
@@ -730,29 +748,54 @@ class Module(MgrModule):
             r = {}
             for opt in self.MODULE_OPTIONS:
                 r[opt['name']] = getattr(self, opt['name'])
-            return 0, json.dumps(r, indent=4), ''
+            r['last_upload'] = time.ctime(self.last_upload) if self.last_upload else self.last_upload
+            return 0, json.dumps(r, indent=4, sort_keys=True), ''
         elif command['prefix'] == 'telemetry on':
             if command.get('license') != LICENSE:
                 return -errno.EPERM, '', "Telemetry data is licensed under the " + LICENSE_NAME + " (" + LICENSE_URL + ").\nTo enable, add '--license " + LICENSE + "' to the 'ceph telemetry on' command."
-            self.set_module_option('enabled', True)
-            self.set_module_option('last_opt_revision', REVISION)
+            self.on()
             return 0, '', ''
         elif command['prefix'] == 'telemetry off':
-            self.set_module_option('enabled', False)
-            self.set_module_option('last_opt_revision', REVISION)
+            self.off()
             return 0, '', ''
         elif command['prefix'] == 'telemetry send':
+            if self.last_opt_revision < LAST_REVISION_RE_OPT_IN and command.get('license') != LICENSE:
+                self.log.debug('A telemetry send attempt while opted-out. Asking for license agreement')
+                return -errno.EPERM, '', "Telemetry data is licensed under the " + LICENSE_NAME + " (" + LICENSE_URL + ").\nTo manually send telemetry data, add '--license " + LICENSE + "' to the 'ceph telemetry send' command.\nPlease consider enabling the telemetry module with 'ceph telemetry on'."
             self.last_report = self.compile_report()
             return self.send(self.last_report, command.get('endpoint'))
 
         elif command['prefix'] == 'telemetry show':
-            report = self.compile_report(
-                channels=command.get('channels', None)
-            )
-            return 0, json.dumps(report, indent=4), ''
+            report = self.get_report(channels=command.get('channels', None))
+            report = json.dumps(report, indent=4, sort_keys=True)
+            if self.channel_device:
+                report += '\n \nDevice report is generated separately. To see it run \'ceph telemetry show-device\'.'
+            return 0, report, ''
+        elif command['prefix'] == 'telemetry show-device':
+            return 0, json.dumps(self.get_report('device'), indent=4, sort_keys=True), ''
+        elif command['prefix'] == 'telemetry show-all':
+            return 0, json.dumps(self.get_report('all'), indent=4, sort_keys=True), ''
         else:
             return (-errno.EINVAL, '',
                     "Command not found '{0}'".format(command['prefix']))
+
+    def on(self):
+        self.set_module_option('enabled', True)
+        self.set_module_option('last_opt_revision', REVISION)
+
+    def off(self):
+        self.set_module_option('enabled', False)
+        self.set_module_option('last_opt_revision', 1)
+
+    def get_report(self, report_type='default', channels=None):
+        if report_type == 'default':
+            return self.compile_report(channels=channels)
+        elif report_type == 'device':
+            return self.gather_device_report()
+        elif report_type == 'all':
+            return {'report': self.compile_report(channels=channels),
+                    'device_report': self.gather_device_report()}
+        return {}
 
     def self_test(self):
         report = self.compile_report()

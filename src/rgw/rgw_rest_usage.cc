@@ -4,6 +4,7 @@
 #include "rgw_op.h"
 #include "rgw_usage.h"
 #include "rgw_rest_usage.h"
+#include "rgw_sal_rados.h"
 
 #include "include/str_list.h"
 
@@ -14,7 +15,7 @@ class RGWOp_Usage_Get : public RGWRESTOp {
 public:
   RGWOp_Usage_Get() {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("usage", RGW_CAP_READ);
   }
   void execute() override;
@@ -52,7 +53,7 @@ void RGWOp_Usage_Get::execute() {
     }
   }
 
-  http_ret = RGWUsage::show(store->getRados(), uid, bucket_name, start, end, show_entries, show_summary, &categories, flusher);
+  op_ret = RGWUsage::show(store->getRados(), uid, bucket_name, start, end, show_entries, show_summary, &categories, flusher);
 }
 
 class RGWOp_Usage_Delete : public RGWRESTOp {
@@ -60,7 +61,7 @@ class RGWOp_Usage_Delete : public RGWRESTOp {
 public:
   RGWOp_Usage_Delete() {}
 
-  int check_caps(RGWUserCaps& caps) override {
+  int check_caps(const RGWUserCaps& caps) override {
     return caps.check_cap("usage", RGW_CAP_WRITE);
   }
   void execute() override;
@@ -87,12 +88,12 @@ void RGWOp_Usage_Delete::execute() {
     bool remove_all;
     RESTArgs::get_bool(s, "remove-all", false, &remove_all);
     if (!remove_all) {
-      http_ret = -EINVAL;
+      op_ret = -EINVAL;
       return;
     }
   }
 
-  http_ret = RGWUsage::trim(store->getRados(), uid, bucket_name, start, end);
+  op_ret = RGWUsage::trim(store->getRados(), uid, bucket_name, start, end);
 }
 
 RGWOp *RGWHandler_Usage::op_get()

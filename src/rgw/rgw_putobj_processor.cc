@@ -18,6 +18,7 @@
 #include "rgw_multi.h"
 #include "rgw_compression.h"
 #include "services/svc_sys_obj.h"
+#include "rgw_sal_rados.h"
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -126,7 +127,7 @@ RadosWriter::~RadosWriter()
   std::optional<rgw_raw_obj> raw_head;
   if (!head_obj.empty()) {
     raw_head.emplace();
-    store->getRados()->obj_to_raw(bucket_info.placement_rule, head_obj, &*raw_head);
+    store->getRados()->obj_to_raw(bucket->get_placement_rule(), head_obj, &*raw_head);
   }
 
   /**
@@ -150,13 +151,13 @@ RadosWriter::~RadosWriter()
 
     int r = store->getRados()->delete_raw_obj(obj);
     if (r < 0 && r != -ENOENT) {
-      ldpp_dout(dpp, 5) << "WARNING: failed to remove obj (" << obj << "), leaked" << dendl;
+      ldpp_dout(dpp, 0) << "WARNING: failed to remove obj (" << obj << "), leaked" << dendl;
     }
   }
 
   if (need_to_remove_head) {
     ldpp_dout(dpp, 5) << "NOTE: we are going to process the head obj (" << *raw_head << ")" << dendl;
-    int r = store->getRados()->delete_obj(obj_ctx, bucket_info, head_obj, 0, 0);
+    int r = store->getRados()->delete_obj(obj_ctx, bucket->get_info(), head_obj, 0, 0);
     if (r < 0 && r != -ENOENT) {
       ldpp_dout(dpp, 0) << "WARNING: failed to remove obj (" << *raw_head << "), leaked" << dendl;
     }
@@ -208,7 +209,7 @@ int AtomicObjectProcessor::prepare(optional_yield y)
   uint64_t alignment;
   rgw_pool head_pool;
 
-  if (!store->getRados()->get_obj_data_pool(bucket_info.placement_rule, head_obj, &head_pool)) {
+  if (!store->getRados()->get_obj_data_pool(bucket->get_placement_rule(), head_obj, &head_pool)) {
     return -EIO;
   }
 
@@ -219,7 +220,7 @@ int AtomicObjectProcessor::prepare(optional_yield y)
 
   bool same_pool = true;
 
-  if (bucket_info.placement_rule != tail_placement_rule) {
+  if (bucket->get_placement_rule() != tail_placement_rule) {
     rgw_pool tail_pool;
     if (!store->getRados()->get_obj_data_pool(tail_placement_rule, head_obj, &tail_pool)) {
       return -EIO;
@@ -250,7 +251,7 @@ int AtomicObjectProcessor::prepare(optional_yield y)
   manifest.set_trivial_rule(head_max_size, stripe_size);
 
   r = manifest_gen.create_begin(store->ctx(), &manifest,
-                                bucket_info.placement_rule,
+                                bucket->get_placement_rule(),
                                 &tail_placement_rule,
                                 head_obj.bucket, head_obj);
   if (r < 0) {
@@ -295,10 +296,10 @@ int AtomicObjectProcessor::complete(size_t accounted_size,
 
   obj_ctx.set_atomic(head_obj);
 
-  RGWRados::Object op_target(store->getRados(), bucket_info, obj_ctx, head_obj);
+  RGWRados::Object op_target(store->getRados(), bucket->get_info(), obj_ctx, head_obj);
 
   /* some object types shouldn't be versioned, e.g., multipart parts */
-  op_target.set_versioning_disabled(!bucket_info.versioning_enabled());
+  op_target.set_versioning_disabled(!bucket->versioning_enabled());
 
   RGWRados::Object::Write obj_op(&op_target);
 
@@ -377,7 +378,7 @@ int MultipartObjectProcessor::prepare_head()
   manifest.set_multipart_part_rule(stripe_size, part_num);
 
   r = manifest_gen.create_begin(store->ctx(), &manifest,
-                                bucket_info.placement_rule,
+                                bucket->get_placement_rule(),
                                 &tail_placement_rule,
                                 target_obj.bucket, target_obj);
   if (r < 0) {
@@ -393,12 +394,10 @@ int MultipartObjectProcessor::prepare_head()
     return r;
   }
   stripe_size = manifest_gen.cur_stripe_max_size();
-
-  uint64_t max_head_size = std::min(chunk_size, stripe_size);
-  set_head_chunk_size(max_head_size);
+  set_head_chunk_size(stripe_size);
 
   chunk = ChunkProcessor(&writer, chunk_size);
-  stripe = StripeProcessor(&chunk, this, max_head_size);
+  stripe = StripeProcessor(&chunk, this, stripe_size);
   return 0;
 }
 
@@ -431,7 +430,7 @@ int MultipartObjectProcessor::complete(size_t accounted_size,
     return r;
   }
 
-  RGWRados::Object op_target(store->getRados(), bucket_info, obj_ctx, head_obj);
+  RGWRados::Object op_target(store->getRados(), bucket->get_info(), obj_ctx, head_obj);
   op_target.set_versioning_disabled(true);
   RGWRados::Object::Write obj_op(&op_target);
 
@@ -475,12 +474,12 @@ int MultipartObjectProcessor::complete(size_t accounted_size,
   encode(info, bl);
 
   rgw_obj meta_obj;
-  meta_obj.init_ns(bucket_info.bucket, mp.get_meta(), RGW_OBJ_NS_MULTIPART);
+  meta_obj.init_ns(bucket->get_key(), mp.get_meta(), RGW_OBJ_NS_MULTIPART);
   meta_obj.set_in_extra_data(true);
 
   rgw_raw_obj raw_meta_obj;
 
-  store->getRados()->obj_to_raw(bucket_info.placement_rule, meta_obj, &raw_meta_obj);
+  store->getRados()->obj_to_raw(bucket->get_placement_rule(), meta_obj, &raw_meta_obj);
 
   auto obj_ctx = store->svc()->sysobj->init_obj_ctx();
   auto sysobj = obj_ctx.get_obj(raw_meta_obj);
@@ -489,7 +488,7 @@ int MultipartObjectProcessor::complete(size_t accounted_size,
       .set_must_exist(true)
       .set(p, bl, null_yield);
   if (r < 0) {
-    return r;
+    return r == -ENOENT ? -ERR_NO_SUCH_UPLOAD : r;
   }
 
   if (!obj_op.meta.canceled) {
@@ -515,7 +514,7 @@ int AppendObjectProcessor::process_first_chunk(bufferlist &&data, rgw::putobj::D
 int AppendObjectProcessor::prepare(optional_yield y)
 {
   RGWObjState *astate;
-  int r = store->getRados()->get_obj_state(&obj_ctx, bucket_info, head_obj, &astate, y);
+  int r = store->getRados()->get_obj_state(&obj_ctx, bucket->get_info(), head_obj, &astate, y);
   if (r < 0) {
     return r;
   }
@@ -548,6 +547,7 @@ int AppendObjectProcessor::prepare(optional_yield y)
       return -ERR_POSITION_NOT_EQUAL_TO_LENGTH;
     }
     try {
+      using ceph::decode;
       decode(cur_part_num, iter->second);
     } catch (buffer::error& err) {
       ldpp_dout(dpp, 5) << "ERROR: failed to decode part num" << dendl;
@@ -561,12 +561,18 @@ int AppendObjectProcessor::prepare(optional_yield y)
       size_t pos = s.find("-");
       cur_etag = s.substr(0, pos);
     }
+
+    iter = astate->attrset.find(RGW_ATTR_STORAGE_CLASS);
+    if (iter != astate->attrset.end()) {
+      tail_placement_rule.storage_class = iter->second.to_str();
+    }
     cur_manifest = &(*astate->manifest);
     manifest.set_prefix(cur_manifest->get_prefix());
+    astate->keep_tail = true;
   }
   manifest.set_multipart_part_rule(store->ctx()->_conf->rgw_obj_stripe_size, cur_part_num);
 
-  r = manifest_gen.create_begin(store->ctx(), &manifest, bucket_info.placement_rule, &tail_placement_rule, head_obj.bucket, head_obj);
+  r = manifest_gen.create_begin(store->ctx(), &manifest, bucket->get_placement_rule(), &tail_placement_rule, head_obj.bucket, head_obj);
   if (r < 0) {
     return r;
   }
@@ -609,7 +615,7 @@ int AppendObjectProcessor::complete(size_t accounted_size, const string &etag, c
     return r;
   }
   obj_ctx.set_atomic(head_obj);
-  RGWRados::Object op_target(store->getRados(), bucket_info, obj_ctx, head_obj);
+  RGWRados::Object op_target(store->getRados(), bucket->get_info(), obj_ctx, head_obj);
   //For Append obj, disable versioning
   op_target.set_versioning_disabled(true);
   RGWRados::Object::Write obj_op(&op_target);
@@ -631,6 +637,7 @@ int AppendObjectProcessor::complete(size_t accounted_size, const string &etag, c
   obj_op.meta.appendable = true;
   //Add the append part number
   bufferlist cur_part_num_bl;
+  using ceph::encode;
   encode(cur_part_num, cur_part_num_bl);
   attrs[RGW_ATTR_APPEND_PART_NUM] = cur_part_num_bl;
   //calculate the etag

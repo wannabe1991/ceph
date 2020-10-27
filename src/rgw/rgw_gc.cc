@@ -17,6 +17,7 @@
 
 #include <list> // XXX
 #include <sstream>
+#include "xxhash.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
@@ -60,7 +61,7 @@ void RGWGC::finalize()
 
 int RGWGC::tag_index(const string& tag)
 {
-  return rgw_shard_id(tag, max_objs);
+  return rgw_shards_mod(XXH64(tag.c_str(), tag.size(), seed), max_objs);
 }
 
 int RGWGC::send_chain(cls_rgw_obj_chain& chain, const string& tag)
@@ -118,7 +119,7 @@ void RGWGC::on_defer_canceled(const cls_rgw_gc_obj_info& info)
   cls_rgw_gc_queue_defer_entry(op, cct->_conf->rgw_gc_obj_min_wait, info);
   cls_rgw_gc_remove(op, {tag});
 
-  auto c = librados::Rados::aio_create_completion(nullptr, nullptr, nullptr);
+  auto c = librados::Rados::aio_create_completion(nullptr, nullptr);
   store->gc_aio_operate(obj_names[i], c, &op);
   c->release();
 }
@@ -139,7 +140,7 @@ int RGWGC::async_defer_chain(const string& tag, const cls_rgw_obj_chain& chain)
     // enqueue succeeds
     cls_rgw_gc_remove(op, {tag});
 
-    auto c = librados::Rados::aio_create_completion(nullptr, nullptr, nullptr);
+    auto c = librados::Rados::aio_create_completion(nullptr, nullptr);
     int ret = store->gc_aio_operate(obj_names[i], c, &op);
     c->release();
     return ret;
@@ -158,7 +159,7 @@ int RGWGC::async_defer_chain(const string& tag, const cls_rgw_obj_chain& chain)
   state->info.chain = chain;
   state->info.tag = tag;
   state->completion = librados::Rados::aio_create_completion(
-      state.get(), async_defer_callback, nullptr);
+      state.get(), async_defer_callback);
 
   int ret = store->gc_aio_operate(obj_names[i], state->completion, &op);
   if (ret == 0) {
@@ -172,7 +173,7 @@ int RGWGC::remove(int index, const std::vector<string>& tags, AioCompletion **pc
   ObjectWriteOperation op;
   cls_rgw_gc_remove(op, tags);
 
-  auto c = librados::Rados::aio_create_completion(nullptr, nullptr, nullptr);
+  auto c = librados::Rados::aio_create_completion(nullptr, nullptr);
   int ret = store->gc_aio_operate(obj_names[index], c, &op);
   if (ret < 0) {
     c->release();
@@ -190,7 +191,7 @@ int RGWGC::remove(int index, int num_entries)
   return store->gc_operate(obj_names[index], &op);
 }
 
-int RGWGC::list(int *index, string& marker, uint32_t max, bool expired_only, std::list<cls_rgw_gc_obj_info>& result, bool *truncated)
+int RGWGC::list(int *index, string& marker, uint32_t max, bool expired_only, std::list<cls_rgw_gc_obj_info>& result, bool *truncated, bool& processing_queue)
 {
   result.clear();
   string next_marker;
@@ -200,14 +201,15 @@ int RGWGC::list(int *index, string& marker, uint32_t max, bool expired_only, std
     std::list<cls_rgw_gc_obj_info> entries, queue_entries;
     int ret = 0;
 
-    if (! transitioned_objects_cache[*index] && ! check_queue) {
+    //processing_queue is set to true from previous iteration if the queue was under process and probably has more elements in it.
+    if (! transitioned_objects_cache[*index] && ! check_queue && ! processing_queue) {
       ret = cls_rgw_gc_list(store->gc_pool_ctx, obj_names[*index], marker, max - result.size(), expired_only, entries, truncated, next_marker);
       if (ret != -ENOENT && ret < 0) {
         return ret;
       }
       obj_version objv;
       cls_version_read(store->gc_pool_ctx, obj_names[*index], &objv);
-      if (ret == -ENOENT) {
+      if (ret == -ENOENT || entries.size() == 0) {
         if (objv.ver == 0) {
           continue;
         } else {
@@ -229,7 +231,8 @@ int RGWGC::list(int *index, string& marker, uint32_t max, bool expired_only, std
         marker.clear();
       }
     }
-    if (transitioned_objects_cache[*index] || check_queue) {
+    if (transitioned_objects_cache[*index] || check_queue || processing_queue) {
+      processing_queue = false;
       ret = cls_rgw_gc_queue_list_entries(store->gc_pool_ctx, obj_names[*index], marker, (max - result.size()) - entries.size(), expired_only, queue_entries, truncated, next_marker);
       if (ret < 0) {
         return ret;
@@ -250,11 +253,23 @@ int RGWGC::list(int *index, string& marker, uint32_t max, bool expired_only, std
     marker = next_marker;
 
     if (*index == max_objs - 1) {
+      if (queue_entries.size() > 0 && *truncated) {
+        processing_queue = true;
+      } else {
+        processing_queue = false;
+      }
       /* we cut short here, truncated will hold the correct value */
       return 0;
     }
 
     if (result.size() == max) {
+      if (queue_entries.size() > 0 && *truncated) {
+        processing_queue = true;
+      } else {
+        processing_queue = false;
+        *index += 1; //move to next gc object
+      }
+
       /* close approximation, it might be that the next of the objects don't hold
        * anything, in this case truncated should have been false, but we can find
        * that out on the next iteration
@@ -264,6 +279,7 @@ int RGWGC::list(int *index, string& marker, uint32_t max, bool expired_only, std
     }
   }
   *truncated = false;
+  processing_queue = false;
 
   return 0;
 }
@@ -323,7 +339,7 @@ public:
       }
     }
 
-    AioCompletion *c = librados::Rados::aio_create_completion(NULL, NULL, NULL);
+    auto c = librados::Rados::aio_create_completion(nullptr, nullptr);
     int ret = ioctx->aio_operate(oid, c, op);
     if (ret < 0) {
       return ret;
@@ -469,6 +485,10 @@ public:
 	    index << " ret=" << ret << dendl;
       return ret;
     }
+    if (perfcounter) {
+      /* log the count of tags retired for rate estimation */
+      perfcounter->inc(l_rgw_gc_retire, num_entries);
+    }
     return 0;
   }
 }; // class RGWGCIOManger
@@ -527,13 +547,13 @@ int RGWGC::process(int index, int max_secs, bool expired_only,
         if (non_expired_entries.size() == 0) {
           transitioned_objects_cache[index] = true;
           marker.clear();
-          ldpp_dout(this, 20) << "RGWGC::process cls_rgw_gc_list returned ENOENT for non expired entries, so setting cache entry to TRUE" << dendl;
+          ldpp_dout(this, 20) << "RGWGC::process cls_rgw_gc_list returned NO non expired entries, so setting cache entry to TRUE" << dendl;
         } else {
           ret = 0;
           goto done;
         }
       }
-      if ((objv.ver == 0) && (ret == -ENOENT)) {
+      if ((objv.ver == 0) && (ret == -ENOENT || entries.size() == 0)) {
         ret = 0;
         goto done;
       }

@@ -7,14 +7,17 @@
 #include "common/errno.h"
 #include "common/Cond.h"
 #include "cls/rbd/cls_rbd_client.h"
+#include "librbd/AsioEngine.h"
 #include "librbd/DeepCopyRequest.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/ImageState.h"
 #include "librbd/internal.h"
+#include "librbd/Operations.h"
 #include "librbd/Utils.h"
 #include "librbd/api/Config.h"
 #include "librbd/api/Trash.h"
+#include "librbd/deep_copy/Handler.h"
 #include "librbd/image/CloneRequest.h"
 #include "librbd/image/RemoveRequest.h"
 #include "librbd/image/PreRemoveRequest.h"
@@ -23,6 +26,8 @@
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
 #define dout_prefix *_dout << "librbd::api::Image: " << __func__ << ": "
+
+using librados::snap_t;
 
 namespace librbd {
 namespace api {
@@ -611,8 +616,9 @@ int Image<I>::deep_copy(I *src, librados::IoCtx& dest_md_ctx,
     C_SaferCond ctx;
     std::string dest_id = util::generate_image_id(dest_md_ctx);
     auto *req = image::CloneRequest<I>::create(
-      config, parent_io_ctx, parent_spec.image_id, "", parent_spec.snap_id,
-      dest_md_ctx, destname, dest_id, opts, "", "", src->op_work_queue, &ctx);
+      config, parent_io_ctx, parent_spec.image_id, "", {}, parent_spec.snap_id,
+      dest_md_ctx, destname, dest_id, opts, cls::rbd::MIRROR_IMAGE_MODE_JOURNAL,
+      "", "", src->op_work_queue, &ctx);
     req->send();
     r = ctx.wait();
   }
@@ -661,7 +667,6 @@ int Image<I>::deep_copy(I *src, librados::IoCtx& dest_md_ctx,
 template <typename I>
 int Image<I>::deep_copy(I *src, I *dest, bool flatten,
                         ProgressContext &prog_ctx) {
-  CephContext *cct = src->cct;
   librados::snap_t snap_id_start = 0;
   librados::snap_t snap_id_end;
   {
@@ -669,15 +674,14 @@ int Image<I>::deep_copy(I *src, I *dest, bool flatten,
     snap_id_end = src->snap_id;
   }
 
-  ThreadPool *thread_pool;
-  ContextWQ *op_work_queue;
-  ImageCtx::get_thread_pool_instance(cct, &thread_pool, &op_work_queue);
+  AsioEngine asio_engine(src->md_ctx);
 
   C_SaferCond cond;
   SnapSeqs snap_seqs;
-  auto req = DeepCopyRequest<I>::create(src, dest, snap_id_start, snap_id_end,
-                                        flatten, boost::none, op_work_queue,
-                                        &snap_seqs, &prog_ctx, &cond);
+  deep_copy::ProgressHandler progress_handler{&prog_ctx};
+  auto req = DeepCopyRequest<I>::create(
+    src, dest, snap_id_start, snap_id_end, 0U, flatten, boost::none,
+    asio_engine.get_work_queue(), &snap_seqs, &progress_handler, &cond);
   req->send();
   int r = cond.wait();
   if (r < 0) {
@@ -819,19 +823,105 @@ int Image<I>::remove(IoCtx& io_ctx, const std::string &image_name,
     // fall-through if trash isn't supported
   }
 
-  ThreadPool *thread_pool;
-  ContextWQ *op_work_queue;
-  ImageCtx::get_thread_pool_instance(cct, &thread_pool, &op_work_queue);
+  AsioEngine asio_engine(io_ctx);
 
   // might be a V1 image format that cannot be moved to the trash
   // and would not have been listed in the V2 directory -- or the OSDs
   // are too old and don't support the trash feature
   C_SaferCond cond;
   auto req = librbd::image::RemoveRequest<I>::create(
-    io_ctx, image_name, "", false, false, prog_ctx, op_work_queue, &cond);
+    io_ctx, image_name, "", false, false, prog_ctx,
+    asio_engine.get_work_queue(), &cond);
   req->send();
 
   return cond.wait();
+}
+
+template <typename I>
+int Image<I>::flatten_children(I *ictx, const char* snap_name,
+                               ProgressContext& pctx) {
+  CephContext *cct = ictx->cct;
+  ldout(cct, 20) << "children flatten " << ictx->name << dendl;
+
+  int r = ictx->state->refresh_if_required();
+  if (r < 0) {
+    return r;
+  }
+
+  std::shared_lock l{ictx->image_lock};
+  snap_t snap_id = ictx->get_snap_id(cls::rbd::UserSnapshotNamespace(),
+                                     snap_name);
+
+  cls::rbd::ParentImageSpec parent_spec{ictx->md_ctx.get_id(),
+                                        ictx->md_ctx.get_namespace(),
+                                        ictx->id, snap_id};
+  std::vector<librbd::linked_image_spec_t> child_images;
+  r = list_children(ictx, parent_spec, &child_images);
+  if (r < 0) {
+    return r;
+  }
+
+  size_t size = child_images.size();
+  if (size == 0) {
+    return 0;
+  }
+
+  librados::IoCtx child_io_ctx;
+  int64_t child_pool_id = -1;
+  size_t i = 0;
+  for (auto &child_image : child_images){
+    std::string pool = child_image.pool_name;
+    if (child_pool_id == -1 ||
+        child_pool_id != child_image.pool_id ||
+        child_io_ctx.get_namespace() != child_image.pool_namespace) {
+      r = util::create_ioctx(ictx->md_ctx, "child image",
+                             child_image.pool_id, child_image.pool_namespace,
+                             &child_io_ctx);
+      if (r < 0) {
+        return r;
+      }
+
+      child_pool_id = child_image.pool_id;
+    }
+
+    ImageCtx *imctx = new ImageCtx("", child_image.image_id, nullptr,
+                                   child_io_ctx, false);
+    r = imctx->state->open(0);
+    if (r < 0) {
+      lderr(cct) << "error opening image: " << cpp_strerror(r) << dendl;
+      return r;
+    }
+
+    if ((imctx->features & RBD_FEATURE_DEEP_FLATTEN) == 0 &&
+        !imctx->snaps.empty()) {
+      lderr(cct) << "snapshot in-use by " << pool << "/" << imctx->name
+                 << dendl;
+      imctx->state->close();
+      return -EBUSY;
+    }
+
+    librbd::NoOpProgressContext prog_ctx;
+    r = imctx->operations->flatten(prog_ctx);
+    if (r < 0) {
+      lderr(cct) << "error flattening image: " << pool << "/"
+                 << (child_image.pool_namespace.empty() ?
+                      "" : "/" + child_image.pool_namespace)
+                 << child_image.image_name << cpp_strerror(r) << dendl;
+      imctx->state->close();
+      return r;
+    }
+
+    r = imctx->state->close();
+    if (r < 0) {
+      lderr(cct) << "failed to close image: " << cpp_strerror(r) << dendl;
+      return r;
+    }
+
+    pctx.update_progress(++i, size);
+    ceph_assert(i <= size);
+  }
+
+  return 0;
 }
 
 } // namespace api

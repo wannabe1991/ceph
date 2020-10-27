@@ -15,6 +15,8 @@
 #include "rgw_op.h"
 #include "rgw_rest.h"
 #include "rgw_rest_user_policy.h"
+#include "rgw_sal_rados.h"
+#include "services/svc_zone.h"
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -42,7 +44,7 @@ int RGWRestUserPolicy::verify_permission()
     return -EACCES;
   }
 
-  if(int ret = check_caps(s->user->caps); ret == 0) {
+  if(int ret = check_caps(s->user->get_caps()); ret == 0) {
     return ret;
   }
 
@@ -73,12 +75,12 @@ bool RGWRestUserPolicy::validate_input()
   return true;
 }
 
-int RGWUserPolicyRead::check_caps(RGWUserCaps& caps)
+int RGWUserPolicyRead::check_caps(const RGWUserCaps& caps)
 {
     return caps.check_cap("user-policy", RGW_CAP_READ);
 }
 
-int RGWUserPolicyWrite::check_caps(RGWUserCaps& caps)
+int RGWUserPolicyWrite::check_caps(const RGWUserCaps& caps)
 {
     return caps.check_cap("user-policy", RGW_CAP_WRITE);
 }
@@ -131,8 +133,15 @@ void RGWPutUserPolicy::execute()
     return;
   }
 
+  ceph::bufferlist in_data;
+  op_ret = store->forward_request_to_master(s->user.get(), nullptr, in_data, nullptr, s->info);
+  if (op_ret < 0) {
+    ldpp_dout(this, 0) << "ERROR: forward_request_to_master returned ret=" << op_ret << dendl;
+    return;
+  }
+
   try {
-    const Policy p(s->cct, s->user->user_id.tenant, bl);
+    const Policy p(s->cct, s->user->get_tenant(), bl);
     map<string, string> policies;
     if (auto it = uattrs.find(RGW_ATTR_USER_POLICY); it != uattrs.end()) {
       bufferlist out_bl = uattrs[RGW_ATTR_USER_POLICY];
@@ -326,6 +335,18 @@ void RGWDeleteUserPolicy::execute()
   if (op_ret < 0) {
     op_ret = -ERR_NO_SUCH_ENTITY;
     return;
+  }
+
+  ceph::bufferlist in_data;
+  op_ret = store->forward_request_to_master(s->user.get(), nullptr, in_data, nullptr, s->info);
+  if (op_ret < 0) {
+    // a policy might've been uploaded to this site when there was no sync
+    // req. in earlier releases, proceed deletion
+    if (op_ret != -ENOENT) {
+      ldpp_dout(this, 5) << "forward_request_to_master returned ret=" << op_ret << dendl;
+      return;
+    }
+    ldpp_dout(this, 0) << "ERROR: forward_request_to_master returned ret=" << op_ret << dendl;
   }
 
   map<string, string> policies;

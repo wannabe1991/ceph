@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import
 
-from . import PLUGIN_MANAGER as PM, Interface, Mixin  # pylint: disable=cyclic-import
+from . import PLUGIN_MANAGER as PM  # pylint: disable=cyclic-import
+from . import Interface, Mixin
 
 
 class CanMgr(Mixin):
     from .. import mgr
-    mgr = mgr
-
-
-class CanLog(Mixin):
-    from .. import logger
-    log = logger
+    mgr = mgr  # type: ignore
 
 
 class CanCherrypy(Mixin):
@@ -35,7 +31,7 @@ class Setupable(Interface):
     def setup(self):
         """
         Placeholder for plugin setup, right after server start.
-        CanMgr.mgr and CanLog.log are initialized by then.
+        CanMgr.mgr is initialized by then.
         """
 
 

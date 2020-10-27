@@ -15,7 +15,7 @@ the Ceph Storage Cluster:
 - The :term:`Ceph Monitor`, which maintains a master copy of the cluster map. 
 - The :term:`Ceph OSD Daemon` (OSD), which stores data as objects on a storage node.
 
-.. ditaa::  
+.. ditaa::
             +---------------------------------+
             |  Ceph Storage Cluster Protocol  |
             |           (librados)            |
@@ -157,7 +157,7 @@ and retrieve data. To interact with OSDs, the client app must invoke
 ``librados``  and connect to a Ceph Monitor. Once connected, ``librados``
 retrieves the  :term:`Cluster Map` from the Ceph Monitor. When the client app
 wants to read or write data, it creates an I/O context and binds to a
-:term:`pool`. The pool has an associated :term:`CRUSH Rule` that defines how it
+:term:`Pool`. The pool has an associated :term:`CRUSH rule` that defines how it
 will place data in the storage cluster. Via the I/O context, the client 
 provides the object name to ``librados``, which takes the object name
 and the cluster map (i.e., the topology of the cluster) and `computes`_ the
@@ -165,7 +165,7 @@ placement group and `OSD`_  for locating the data. Then the client application
 can read or write data. The client app doesn't need to learn about the topology
 of the cluster directly.
 
-.. ditaa:: 
+.. ditaa::
             +--------+  Retrieves  +---------------+
             | Client |------------>|  Cluster Map  |
             +--------+             +---------------+
@@ -217,7 +217,8 @@ these capabilities. The following diagram provides a high-level flow for the
 initial connection.
 
 
-.. ditaa:: +---------+     +---------+
+.. ditaa::
+           +---------+     +---------+
            | Client  |     | Monitor |
            +---------+     +---------+
                 |               |
@@ -521,7 +522,8 @@ functionality includes:
 - Snapshot pools, list snapshots, etc.
 
 
-.. ditaa:: +---------+     +---------+     +---------+
+.. ditaa::
+           +---------+     +---------+     +---------+
            | Client  |     | Monitor |     |   OSD   |
            +---------+     +---------+     +---------+
                 |               |               |
