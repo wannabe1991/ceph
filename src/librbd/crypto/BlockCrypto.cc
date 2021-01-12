@@ -12,10 +12,19 @@ namespace crypto {
 
 template <typename T>
 BlockCrypto<T>::BlockCrypto(CephContext* cct, DataCryptor<T>* data_cryptor,
-                            uint32_t block_size)
+                            uint64_t block_size, uint64_t data_offset)
      : m_cct(cct), m_data_cryptor(data_cryptor), m_block_size(block_size),
-       m_iv_size(data_cryptor->get_iv_size()) {
+       m_data_offset(data_offset), m_iv_size(data_cryptor->get_iv_size()) {
+  ceph_assert(isp2(block_size));
   ceph_assert((block_size % data_cryptor->get_block_size()) == 0);
+}
+
+template <typename T>
+BlockCrypto<T>::~BlockCrypto() {
+  if (m_data_cryptor != nullptr) {
+    delete m_data_cryptor;
+    m_data_cryptor = nullptr;
+  }
 }
 
 template <typename T>
@@ -37,6 +46,7 @@ int BlockCrypto<T>::crypt(ceph::bufferlist* data, uint64_t image_offset,
 
   bufferlist src = *data;
   data->clear();
+  src.rebuild_aligned_size_and_memory(m_block_size, CEPH_PAGE_SIZE);
 
   auto ctx = m_data_cryptor->get_context(mode);
   if (ctx == nullptr) {
@@ -99,3 +109,5 @@ int BlockCrypto<T>::decrypt(ceph::bufferlist* data, uint64_t image_offset) {
 
 } // namespace crypto
 } // namespace librbd
+
+template class librbd::crypto::BlockCrypto<EVP_CIPHER_CTX>;

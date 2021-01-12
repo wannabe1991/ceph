@@ -4,7 +4,7 @@ import logging
 import traceback
 import threading
 
-from mgr_module import MgrModule
+from mgr_module import MgrModule, Option
 import orchestrator
 
 from .fs.volume import VolumeClient
@@ -117,6 +117,25 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
             'desc': "Delete a CephFS subvolume in a volume, and optionally, "
                     "in a specific subvolume group, force deleting a cancelled or failed "
                     "clone, and retaining existing subvolume snapshots",
+            'perm': 'rw'
+        },
+        {
+            'cmd': 'fs subvolume authorize '
+                   'name=vol_name,type=CephString '
+                   'name=sub_name,type=CephString '
+                   'name=auth_id,type=CephString '
+                   'name=group_name,type=CephString,req=false '
+                   'name=access_level,type=CephString,req=false ',
+            'desc': "Allow a cephx auth ID access to a subvolume",
+            'perm': 'rw'
+        },
+        {
+            'cmd': 'fs subvolume deauthorize '
+                   'name=vol_name,type=CephString '
+                   'name=sub_name,type=CephString '
+                   'name=auth_id,type=CephString '
+                   'name=group_name,type=CephString,req=false ',
+            'desc': "Deny a cephx auth ID access to a subvolume",
             'perm': 'rw'
         },
         {
@@ -377,12 +396,12 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
     ]
 
     MODULE_OPTIONS = [
-        {
-            'name': 'max_concurrent_clones',
-            'type': 'int',
-            'default': 4,
-            'desc': 'Number of asynchronous cloner threads',
-        }
+        Option(
+            'max_concurrent_clones',
+            type='int',
+            default=4,
+            desc='Number of asynchronous cloner threads',
+        )
     ]
 
     def __init__(self, *args, **kwargs):
@@ -493,6 +512,27 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
                                         group_name=cmd.get('group_name', None),
                                         force=cmd.get('force', False),
                                         retain_snapshots=cmd.get('retain_snapshots', False))
+
+    @mgr_cmd_wrap
+    def _cmd_fs_subvolume_authorize(self, inbuf, cmd):
+        """
+        :return: a 3-tuple of return code(int), secret key(str), error message (str)
+        """
+        return self.vc.authorize_subvolume(vol_name=cmd['vol_name'],
+                                           sub_name=cmd['sub_name'],
+                                           auth_id=cmd['auth_id'],
+                                           group_name=cmd.get('group_name', None),
+                                           access_level=cmd.get('access_level', 'rw'))
+
+    @mgr_cmd_wrap
+    def _cmd_fs_subvolume_deauthorize(self, inbuf, cmd):
+        """
+        :return: a 3-tuple of return code(int), empty string(str), error message (str)
+        """
+        return self.vc.deauthorize_subvolume(vol_name=cmd['vol_name'],
+                                             sub_name=cmd['sub_name'],
+                                             auth_id=cmd['auth_id'],
+                                             group_name=cmd.get('group_name', None))
 
     @mgr_cmd_wrap
     def _cmd_fs_subvolume_ls(self, inbuf, cmd):

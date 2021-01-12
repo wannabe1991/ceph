@@ -8,6 +8,7 @@
 #include "librbd/Types.h"
 #include "librbd/migration/FormatInterface.h"
 #include "json_spirit/json_spirit.h"
+#include <map>
 #include <memory>
 
 struct Context;
@@ -19,17 +20,20 @@ struct ImageCtx;
 
 namespace migration {
 
-struct StreamInterface;
+template <typename> struct SourceSpecBuilder;
+struct SnapshotInterface;
 
 template <typename ImageCtxT>
 class RawFormat : public FormatInterface {
 public:
-  static RawFormat* create(ImageCtxT* image_ctx,
-                           const json_spirit::mObject& json_object) {
-    return new RawFormat(image_ctx, json_object);
+  static RawFormat* create(
+      ImageCtxT* image_ctx, const json_spirit::mObject& json_object,
+      const SourceSpecBuilder<ImageCtxT>* source_spec_builder) {
+    return new RawFormat(image_ctx, json_object, source_spec_builder);
   }
 
-  RawFormat(ImageCtxT* image_ctx, const json_spirit::mObject& json_object);
+  RawFormat(ImageCtxT* image_ctx, const json_spirit::mObject& json_object,
+            const SourceSpecBuilder<ImageCtxT>* source_spec_builder);
   RawFormat(const RawFormat&) = delete;
   RawFormat& operator=(const RawFormat&) = delete;
 
@@ -51,11 +55,19 @@ public:
                   Context* on_finish) override;
 
 private:
+  typedef std::shared_ptr<SnapshotInterface> Snapshot;
+  typedef std::map<uint64_t, Snapshot> Snapshots;
+
   ImageCtxT* m_image_ctx;
   json_spirit::mObject m_json_object;
+  const SourceSpecBuilder<ImageCtxT>* m_source_spec_builder;
 
-  std::unique_ptr<StreamInterface> m_stream;
+  Snapshots m_snapshots;
 
+  void handle_open(int r, Context* on_finish);
+
+  void handle_list_snaps(int r, io::SnapIds&& snap_ids,
+                         io::SnapshotDelta* snapshot_delta, Context* on_finish);
 };
 
 } // namespace migration

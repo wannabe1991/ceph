@@ -28,7 +28,8 @@ add_definitions(
   -D_REENTRANT
   -D_THREAD_SAFE
   -D__STDC_FORMAT_MACROS
-  -D_FILE_OFFSET_BITS=64)
+  -D_FILE_OFFSET_BITS=64
+  -DBOOST_ASIO_DISABLE_THREAD_KEYWORD_EXTENSION)
 if(LINUX)
   add_definitions("-D_GNU_SOURCE")
 endif()
@@ -126,10 +127,12 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
         -D_FORTIFY_SOURCE=2)
     endif()
   endif()
-  CHECK_C_COMPILER_FLAG(-fstack-protector-strong HAS_STACK_PROTECT)
-  if (HAS_STACK_PROTECT)
-    add_compile_options(-fstack-protector-strong)
-  endif()
+  if(NOT WIN32)
+    CHECK_C_COMPILER_FLAG(-fstack-protector-strong HAS_STACK_PROTECT)
+    if (HAS_STACK_PROTECT)
+      add_compile_options(-fstack-protector-strong)
+    endif()
+  endif(NOT WIN32)
 endif(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
 
 CHECK_C_COMPILER_FLAG("-D_GLIBCXX_ASSERTIONS" HAS_GLIBCXX_ASSERTIONS)
@@ -139,20 +142,21 @@ endif()
 
 include(SIMDExt)
 if(HAVE_INTEL)
-  set(CMAKE_ASM_COMPILER  ${PROJECT_SOURCE_DIR}/src/yasm-wrapper)
   if(APPLE)
     set(object_format "macho64")
   else()
     set(object_format "elf64")
   endif()
   set(CMAKE_ASM_FLAGS "-f ${object_format}")
+  set(CMAKE_ASM_COMPILER ${PROJECT_SOURCE_DIR}/src/nasm-wrapper)
   if(NOT WIN32)
     # The native tools might be located even when cross compiling, which
     # might not work in this case (especially when targeting Windows).
-    include(CheckYasm)
-    check_yasm_support(${object_format}
-      HAVE_GOOD_YASM_ELF64
-      HAVE_BETTER_YASM_ELF64)
+    include(CheckNasm)
+    check_nasm_support(${object_format}
+      HAVE_NASM_X64
+      HAVE_NASM_X64_AVX2
+      HAVE_NASM_X64_AVX512)
   endif()
 endif()
 
@@ -296,7 +300,7 @@ add_subdirectory(json_spirit)
 include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/src/xxHash")
 include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/src/rapidjson/include")
 
-find_package(fmt 5.2.1 QUIET)
+find_package(fmt 6.0.0 QUIET)
 if(fmt_FOUND)
   include_directories(SYSTEM "${fmt_INCLUDE_DIR}")
 else()
@@ -327,7 +331,7 @@ if(WITH_SEASTAR)
       _find_package(${ARGV})
     endif()
   endmacro ()
-  set(Seastar_API_LEVEL "5" CACHE STRING "" FORCE)
+  set(Seastar_API_LEVEL "6" CACHE STRING "" FORCE)
   set(Seastar_HWLOC OFF CACHE BOOL "" FORCE)
   set(Seastar_STD_OPTIONAL_VARIANT_STRINGVIEW ON CACHE BOOL "" FORCE)
   if(Seastar_DPDK)
@@ -382,9 +386,49 @@ set(libcommon_files
   osdc/error_code.cc
   librbd/Features.cc
   ${mds_files})
+if(WITH_JAEGER)
+  list(APPEND libcommon_files common/tracer.cc)
+endif()
 set_source_files_properties(ceph_ver.c
   APPEND PROPERTY OBJECT_DEPENDS ${CMAKE_BINARY_DIR}/src/include/ceph_ver.h)
 add_library(common-objs OBJECT ${libcommon_files})
+
+if(WITH_JAEGER)
+  find_package(yaml-cpp 0.6.0)
+  if(NOT yaml-cpp_FOUND)
+    set(jaeger_libs ${CMAKE_BINARY_DIR}/external/lib/libyaml-cpp.so
+		    ${CMAKE_BINARY_DIR}/external/lib/libyaml-cpp.so.0.6
+		    ${CMAKE_BINARY_DIR}/external/lib/libyaml-cpp.so.0.6.2)
+    #customize libjaeger.install
+    execute_process(COMMAND bash -c "sed -i 's/#//' debian/libjaeger.install"
+		    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    execute_process(COMMAND bash -c "grep -q 'yaml-cpp' debian/libjaeger.install || echo 'usr/lib/libyaml-cpp.so.*' >> debian/libjaeger.install"
+		    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  endif()
+  include(IncludeJaeger)
+  add_library(jaeger-base INTERFACE)
+  add_dependencies(common-objs
+  yaml-cpp::yaml-cpp
+  opentracing::libopentracing
+  thrift::libthrift
+  jaegertracing::libjaegertracing)
+  target_link_libraries(jaeger-base INTERFACE
+  yaml-cpp::yaml-cpp
+  opentracing::libopentracing
+  thrift::libthrift
+  jaegertracing::libjaegertracing)
+  include_directories(SYSTEM ${CMAKE_BINARY_DIR}/external/include)
+  #with CMake 3.12+ the following can be replaced by:
+  #target_link_libraries(common-objs jaeger-base)
+   list(APPEND jaeger_libs
+    ${CMAKE_BINARY_DIR}/external/lib/libjaegertracing.so.0
+    ${CMAKE_BINARY_DIR}/external/lib/libjaegertracing.so.0.6.1
+    ${CMAKE_BINARY_DIR}/external/lib/libopentracing.so.1
+    ${CMAKE_BINARY_DIR}/external/lib/libopentracing.so.1.6.0
+    ${CMAKE_BINARY_DIR}/external/lib/libthrift.so.0.13.0)
+  install(FILES ${jaeger_libs}
+    DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
 
 CHECK_C_COMPILER_FLAG("-fvar-tracking-assignments" HAS_VTA)
 add_subdirectory(auth)
@@ -444,6 +488,10 @@ endif()
 
 if(WITH_DPDK)
   list(APPEND ceph_common_deps common_async_dpdk)
+endif()
+
+if(WITH_JAEGER)
+  list(APPEND ceph_common_deps jaeger-base)
 endif()
 
 if(WIN32)
@@ -508,7 +556,9 @@ endif(${WITH_LTTNG})
 
 add_subdirectory(global)
 
-add_subdirectory(lua)
+if(NOT WIN32)
+  find_package(Lua 5.3 REQUIRED)
+endif()
 
 # rados object classes
 add_subdirectory(cls)
@@ -546,10 +596,12 @@ if(NOT CEPH_BUILD_VIRTUALENV)
   set(CEPH_BUILD_VIRTUALENV ${CMAKE_BINARY_DIR})
 endif()
 
+if(NOT WIN32)
 add_subdirectory(pybind)
 add_subdirectory(ceph-volume)
 add_subdirectory(python-common)
 add_subdirectory(cephadm)
+endif(NOT WIN32)
 
 # Monitor
 add_subdirectory(mon)
@@ -579,10 +631,9 @@ endif()
 
 add_subdirectory(kv)
 add_subdirectory(os)
+
 if(NOT WIN32)
 add_subdirectory(blk)
-endif()
-
 add_subdirectory(osd)
 
 set(ceph_osd_srcs
@@ -591,6 +642,9 @@ set(ceph_osd_srcs
   osd/objclass.cc
   objclass/class_api.cc
   ceph_osd.cc)
+if(WITH_JAEGER)
+  list(APPEND ceph_osd_srcs common/tracer.cc)
+endif()
 add_executable(ceph-osd ${ceph_osd_srcs})
 add_dependencies(ceph-osd erasure_code_plugins)
 target_link_libraries(ceph-osd osd os global-static common
@@ -602,6 +656,8 @@ set_target_properties(ceph-osd PROPERTIES
   POSITION_INDEPENDENT_CODE ${EXE_LINKER_USE_PIE}
   INSTALL_RPATH "")
 install(TARGETS ceph-osd DESTINATION bin)
+
+endif(NOT WIN32)
 
 if (WITH_CEPHFS)
   add_subdirectory(mds)
@@ -824,6 +880,7 @@ configure_file(
   ${CMAKE_BINARY_DIR}/include/acconfig.h
 )
 
+if(NOT WIN32)
 # Everything you need to spin up a cluster with vstart.sh
 add_custom_target(vstart-base DEPENDS
     ceph-osd
@@ -860,6 +917,7 @@ endif()
 if(WITH_MGR)
   add_dependencies(vstart ceph-volume-venv-setup)
 endif()
+endif(NOT WIN32)
 
 # Everything you need to run CephFS tests
 add_custom_target(cephfs_testing DEPENDS

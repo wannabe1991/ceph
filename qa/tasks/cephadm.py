@@ -66,6 +66,19 @@ def build_initial_config(ctx, config):
 
     return conf
 
+def update_archive_setting(ctx, key, value):
+    """
+    Add logs directory to job's info log file
+    """
+    with open(os.path.join(ctx.archive, 'info.yaml'), 'r+') as info_file:
+        info_yaml = yaml.safe_load(info_file)
+        info_file.seek(0)
+        if 'archive' in info_yaml:
+            info_yaml['archive'][key] = value
+        else:
+            info_yaml['archive'] = {key: value}
+        yaml.safe_dump(info_yaml, info_file, default_flow_style=False)
+
 @contextlib.contextmanager
 def normalize_hostnames(ctx):
     """
@@ -73,11 +86,7 @@ def normalize_hostnames(ctx):
     remote.shortname and socket.gethostname() in cephadm.
     """
     log.info('Normalizing hostnames...')
-    ctx.cluster.run(args=[
-        'sudo',
-        'hostname',
-        run.Raw('$(hostname -s)'),
-    ])
+    ctx.cluster.sh('sudo hostname $(hostname -s)')
 
     try:
         yield
@@ -159,15 +168,8 @@ def ceph_log(ctx, config):
     cluster_name = config['cluster']
     fsid = ctx.ceph[cluster_name].fsid
 
-    # Add logs directory to job's info log file
-    with open(os.path.join(ctx.archive, 'info.yaml'), 'r+') as info_file:
-        info_yaml = yaml.safe_load(info_file)
-        info_file.seek(0)
-        if 'archive' not in info_yaml:
-            info_yaml['archive'] = {'log': '/var/log/ceph'}
-        else:
-            info_yaml['archive']['log'] = '/var/log/ceph'
-        yaml.safe_dump(info_yaml, info_file, default_flow_style=False)
+    update_archive_setting(ctx, 'log', '/var/log/ceph')
+
 
     try:
         yield
@@ -228,28 +230,10 @@ def ceph_log(ctx, config):
                 not (ctx.config.get('archive-on-error') and ctx.summary['success']):
             # and logs
             log.info('Compressing logs...')
-            run.wait(
-                ctx.cluster.run(
-                    args=[
-                        'sudo',
-                        'find',
-                        '/var/log/ceph',   # all logs, not just for the cluster
-                        '/var/log/rbd-target-api', # ceph-iscsi
-                        '-name',
-                        '*.log',
-                        '-print0',
-                        run.Raw('|'),
-                        'sudo',
-                        'xargs',
-                        '-0',
-                        '--no-run-if-empty',
-                        '--',
-                        'gzip',
-                        '--',
-                    ],
-                    wait=False,
-                ),
-            )
+            ctx.cluster.sh(
+                'sudo find /var/log/ceph -name *.log -print0 | '
+                'sudo xargs -0 --no-run-if-empty -- gzip --',
+                wait=False)
 
             log.info('Archiving logs...')
             path = os.path.join(ctx.archive, 'remote')
@@ -277,15 +261,7 @@ def ceph_crash(ctx, config):
     cluster_name = config['cluster']
     fsid = ctx.ceph[cluster_name].fsid
 
-    # Add logs directory to job's info log file
-    with open(os.path.join(ctx.archive, 'info.yaml'), 'r+') as info_file:
-        info_yaml = yaml.safe_load(info_file)
-        info_file.seek(0)
-        if 'archive' not in info_yaml:
-            info_yaml['archive'] = {'crash': '/var/lib/ceph/%s/crash' % fsid}
-        else:
-            info_yaml['archive']['crash'] = '/var/lib/ceph/%s/crash' % fsid
-        yaml.safe_dump(info_yaml, info_file, default_flow_style=False)
+    update_archive_setting(ctx, 'crash', '/var/lib/ceph/crash')
 
     try:
         yield
@@ -330,12 +306,8 @@ def ceph_bootstrap(ctx, config, registry):
     first_mon_role = ctx.ceph[cluster_name].first_mon_role
     mons = ctx.ceph[cluster_name].mons
 
-    ctx.cluster.run(args=[
-        'sudo', 'mkdir', '-p', '/etc/ceph',
-        ]);
-    ctx.cluster.run(args=[
-        'sudo', 'chmod', '777', '/etc/ceph',
-        ]);
+    ctx.cluster.sh('sudo mkdir -p /etc/ceph')
+    ctx.cluster.sh('sudo chmod 777 /etc/ceph')
     if registry:
         add_mirror_to_cluster(ctx, registry)
     try:
@@ -423,15 +395,11 @@ def ceph_bootstrap(ctx, config, registry):
             f'{testdir}/{cluster_name}.pub').decode('ascii').strip()
 
         log.info('Installing pub ssh key for root users...')
-        ctx.cluster.run(args=[
-            'sudo', 'install', '-d', '-m', '0700', '/root/.ssh',
-            run.Raw('&&'),
-            'echo', ssh_pub_key,
-            run.Raw('|'),
-            'sudo', 'tee', '-a', '/root/.ssh/authorized_keys',
-            run.Raw('&&'),
-            'sudo', 'chmod', '0600', '/root/.ssh/authorized_keys',
-        ])
+        ctx.cluster.sh(
+            'sudo install -d -m 0700 /root/.ssh &&'
+            f'echo {ssh_pub_key} |'
+            'sudo tee -a /root/.ssh/authorized_keys &&'
+            'sudo chmod 0600 /root/.ssh/authorized_keys')
 
         # set options
         _shell(ctx, cluster_name, bootstrap_remote,
@@ -539,11 +507,12 @@ def ceph_mons(ctx, config):
                             break
 
         # refresh our (final) ceph.conf file
+        bootstrap_remote = ctx.ceph[cluster_name].bootstrap_remote
         log.info('Generating final ceph.conf file...')
         r = _shell(
             ctx=ctx,
             cluster_name=cluster_name,
-            remote=remote,
+            remote=bootstrap_remote,
             args=[
                 'ceph', 'config', 'generate-minimal-conf',
             ],
@@ -571,10 +540,10 @@ def ceph_mgrs(ctx, config):
             for mgr in [r for r in roles
                         if teuthology.is_type('mgr', cluster_name)(r)]:
                 c_, _, id_ = teuthology.split_role(mgr)
-                if c_ == cluster_name and id_ == ctx.ceph[cluster_name].first_mgr:
-                    continue
                 log.info('Adding %s on %s' % (mgr, remote.shortname))
                 nodes.append(remote.shortname + '=' + id_)
+                if c_ == cluster_name and id_ == ctx.ceph[cluster_name].first_mgr:
+                    continue
                 daemons[mgr] = (remote, id_)
         if nodes:
             _shell(ctx, cluster_name, remote, [
@@ -1049,6 +1018,28 @@ def crush_setup(ctx, config):
     yield
 
 @contextlib.contextmanager
+def create_rbd_pool(ctx, config):
+    if config.get('create_rbd_pool', False):
+      cluster_name = config['cluster']
+      log.info('Waiting for OSDs to come up')
+      teuthology.wait_until_osds_up(
+          ctx,
+          cluster=ctx.cluster,
+          remote=ctx.ceph[cluster_name].bootstrap_remote,
+          ceph_cluster=cluster_name,
+      )
+      log.info('Creating RBD pool')
+      _shell(ctx, cluster_name, ctx.ceph[cluster_name].bootstrap_remote,
+          args=['sudo', 'ceph', '--cluster', cluster_name,
+                'osd', 'pool', 'create', 'rbd', '8'])
+      _shell(ctx, cluster_name, ctx.ceph[cluster_name].bootstrap_remote,
+          args=['sudo', 'ceph', '--cluster', cluster_name,
+                'osd', 'pool', 'application', 'enable',
+                'rbd', 'rbd', '--yes-i-really-mean-it'
+          ])
+    yield
+
+@contextlib.contextmanager
 def _bypass():
     yield
 
@@ -1255,6 +1246,7 @@ def task(ctx, config):
             lambda: ceph_monitoring('alertmanager', ctx=ctx, config=config),
             lambda: ceph_monitoring('grafana', ctx=ctx, config=config),
             lambda: ceph_clients(ctx=ctx, config=config),
+            lambda: create_rbd_pool(ctx=ctx, config=config),
     ):
         ctx.managers[cluster_name] = CephManager(
             ctx.ceph[cluster_name].bootstrap_remote,
@@ -1295,13 +1287,17 @@ def registries_add_mirror_to_docker_io(conf, mirror):
         }
     else:
         v2 = config  # type: ignore
-    dockers = [r for r in v2['registry'] if r['prefix'] == 'docker.io']
+    dockers = [
+        r for r in v2['registry'] if
+           r.get('prefix') == 'docker.io' or r.get('location') == 'docker.io'
+    ]
     if dockers:
         docker = dockers[0]
-        docker['mirror'] = [{
-            "location": mirror,
-            "insecure": True,
-        }]
+        if 'mirror' not in docker:
+            docker['mirror'] = [{
+                "location": mirror,
+                "insecure": True,
+            }]
     return v2
 
 

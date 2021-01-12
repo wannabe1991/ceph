@@ -761,28 +761,28 @@ void PGMapDigest::dump_pool_stats_full(
     f->open_array_section("pools");
   } else {
     tbl.define_column("POOL", TextTable::LEFT, TextTable::LEFT);
-    tbl.define_column("ID", TextTable::LEFT, TextTable::RIGHT);
-    tbl.define_column("PGS", TextTable::LEFT, TextTable::RIGHT);
-    tbl.define_column("STORED", TextTable::LEFT, TextTable::RIGHT);
+    tbl.define_column("ID", TextTable::RIGHT, TextTable::RIGHT);
+    tbl.define_column("PGS", TextTable::RIGHT, TextTable::RIGHT);
+    tbl.define_column("STORED", TextTable::RIGHT, TextTable::RIGHT);
     if (verbose) {
-      tbl.define_column("(DATA)", TextTable::LEFT, TextTable::RIGHT);
-      tbl.define_column("(OMAP)", TextTable::LEFT, TextTable::RIGHT);
+      tbl.define_column("(DATA)", TextTable::RIGHT, TextTable::RIGHT);
+      tbl.define_column("(OMAP)", TextTable::RIGHT, TextTable::RIGHT);
     }
-    tbl.define_column("OBJECTS", TextTable::LEFT, TextTable::RIGHT);
-    tbl.define_column("USED", TextTable::LEFT, TextTable::RIGHT);
+    tbl.define_column("OBJECTS", TextTable::RIGHT, TextTable::RIGHT);
+    tbl.define_column("USED", TextTable::RIGHT, TextTable::RIGHT);
     if (verbose) {
-      tbl.define_column("(DATA)", TextTable::LEFT, TextTable::RIGHT);
-      tbl.define_column("(OMAP)", TextTable::LEFT, TextTable::RIGHT);
+      tbl.define_column("(DATA)", TextTable::RIGHT, TextTable::RIGHT);
+      tbl.define_column("(OMAP)", TextTable::RIGHT, TextTable::RIGHT);
     }
-    tbl.define_column("%USED", TextTable::LEFT, TextTable::RIGHT);
-    tbl.define_column("MAX AVAIL", TextTable::LEFT, TextTable::RIGHT);
+    tbl.define_column("%USED", TextTable::RIGHT, TextTable::RIGHT);
+    tbl.define_column("MAX AVAIL", TextTable::RIGHT, TextTable::RIGHT);
 
     if (verbose) {
-      tbl.define_column("QUOTA OBJECTS", TextTable::LEFT, TextTable::LEFT);
-      tbl.define_column("QUOTA BYTES", TextTable::LEFT, TextTable::LEFT);
-      tbl.define_column("DIRTY", TextTable::LEFT, TextTable::RIGHT);
-      tbl.define_column("USED COMPR", TextTable::LEFT, TextTable::RIGHT);
-      tbl.define_column("UNDER COMPR", TextTable::LEFT, TextTable::RIGHT);
+      tbl.define_column("QUOTA OBJECTS", TextTable::RIGHT, TextTable::RIGHT);
+      tbl.define_column("QUOTA BYTES", TextTable::RIGHT, TextTable::RIGHT);
+      tbl.define_column("DIRTY", TextTable::RIGHT, TextTable::RIGHT);
+      tbl.define_column("USED COMPR", TextTable::RIGHT, TextTable::RIGHT);
+      tbl.define_column("UNDER COMPR", TextTable::RIGHT, TextTable::RIGHT);
     }
   }
 
@@ -873,11 +873,11 @@ void PGMapDigest::dump_cluster_stats(stringstream *ss,
     ceph_assert(ss != nullptr);
     TextTable tbl;
     tbl.define_column("CLASS", TextTable::LEFT, TextTable::LEFT);
-    tbl.define_column("SIZE", TextTable::LEFT, TextTable::RIGHT);
-    tbl.define_column("AVAIL", TextTable::LEFT, TextTable::RIGHT);
-    tbl.define_column("USED", TextTable::LEFT, TextTable::RIGHT);
-    tbl.define_column("RAW USED", TextTable::LEFT, TextTable::RIGHT);
-    tbl.define_column("%RAW USED", TextTable::LEFT, TextTable::RIGHT);
+    tbl.define_column("SIZE", TextTable::RIGHT, TextTable::RIGHT);
+    tbl.define_column("AVAIL", TextTable::RIGHT, TextTable::RIGHT);
+    tbl.define_column("USED", TextTable::RIGHT, TextTable::RIGHT);
+    tbl.define_column("RAW USED", TextTable::RIGHT, TextTable::RIGHT);
+    tbl.define_column("%RAW USED", TextTable::RIGHT, TextTable::RIGHT);
 
 
     for (auto& i : osd_sum_by_class) {
@@ -3261,8 +3261,8 @@ void PGMap::get_health_checks(
 	summary += " reporting legacy (not per-pool) BlueStore stats";
       } else if (asum.first == "BLUESTORE_DISK_SIZE_MISMATCH") {
 	summary += " have dangerous mismatch between BlueStore block device and free list sizes";
-      } else if (asum.first == "BLUESTORE_NO_PER_POOL_OMAP") {
-	summary += " reporting legacy (not per-pool) BlueStore omap usage stats";
+      } else if (asum.first == "BLUESTORE_NO_PER_PG_OMAP") {
+	summary += " reporting legacy (not per-pg) BlueStore omap usage stats";
       } else if (asum.first == "BLUESTORE_SPURIOUS_READ_ERRORS") {
         summary += " have spurious read errors";
       }
@@ -3487,7 +3487,7 @@ int process_pg_map_command(
   string omap_stats_note =
       "\n* NOTE: Omap statistics are gathered during deep scrub and "
       "may be inaccurate soon afterwards depending on utilization. See "
-      "http://docs.ceph.com/docs/master/dev/placement-group/#omap-statistics "
+      "http://docs.ceph.com/en/latest/dev/placement-group/#omap-statistics "
       "for further details.\n";
   bool omap_stats_note_required = false;
 
@@ -3496,13 +3496,11 @@ int process_pg_map_command(
   if (prefix == "pg dump_json") {
     vector<string> v;
     v.push_back(string("all"));
-    cmd_putval(g_ceph_context, cmdmap, "format", string("json"));
     cmd_putval(g_ceph_context, cmdmap, "dumpcontents", v);
     prefix = "pg dump";
   } else if (prefix == "pg dump_pools_json") {
     vector<string> v;
     v.push_back(string("pools"));
-    cmd_putval(g_ceph_context, cmdmap, "format", string("json"));
     cmd_putval(g_ceph_context, cmdmap, "dumpcontents", v);
     prefix = "pg dump";
   } else if (prefix == "pg ls-by-primary") {

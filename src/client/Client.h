@@ -47,6 +47,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 
 using std::set;
 using std::map;
@@ -243,6 +244,7 @@ public:
   template <typename T> friend class RWRef;
 
   using Dispatcher::cct;
+  using clock = ceph::coarse_mono_clock;
 
   typedef int (*add_dirent_cb_t)(void *p, struct dirent *de, struct ceph_statx *stx, off_t off, Inode *in);
 
@@ -255,6 +257,13 @@ public:
 	     bufferlist& out) override;
   private:
     Client *m_client;
+  };
+
+  // snapshot info returned via get_snap_info(). nothing to do
+  // with SnapInfo on the MDS.
+  struct SnapInfo {
+    snapid_t id;
+    std::map<std::string, std::string> metadata;
   };
 
   Client(Messenger *m, MonClient *mc, Objecter *objecter_);
@@ -438,6 +447,8 @@ public:
   int sync_fs();
   int64_t drop_caches();
 
+  int get_snap_info(const char *path, const UserPerm &perms, SnapInfo *snap_info);
+
   // hpc lazyio
   int lazyio(int fd, int enable);
   int lazyio_propagate(int fd, loff_t offset, size_t count);
@@ -464,8 +475,9 @@ public:
   int enumerate_layout(int fd, vector<ObjectExtent>& result,
 		       loff_t length, loff_t offset);
 
-  int mksnap(const char *path, const char *name, const UserPerm& perm);
-  int rmsnap(const char *path, const char *name, const UserPerm& perm);
+  int mksnap(const char *path, const char *name, const UserPerm& perm,
+             mode_t mode=0, const std::map<std::string, std::string> &metadata={});
+  int rmsnap(const char *path, const char *name, const UserPerm& perm, bool check_perms=false);
 
   // Inode permission checking
   int inode_permission(Inode *in, const UserPerm& perms, unsigned want);
@@ -737,7 +749,25 @@ public:
   void renew_caps();
   void renew_caps(MetaSession *session);
   void flush_cap_releases();
+  void renew_and_flush_cap_releases();
   void tick();
+  void start_tick_thread();
+
+  void inc_dentry_nr() {
+    ++dentry_nr;
+  }
+  void dec_dentry_nr() {
+    --dentry_nr;
+  }
+  void dlease_hit() {
+    ++dlease_hits;
+  }
+  void dlease_miss() {
+    ++dlease_misses;
+  }
+  std::tuple<uint64_t, uint64_t, uint64_t> get_dlease_hit_rates() {
+    return std::make_tuple(dlease_hits, dlease_misses, dentry_nr);
+  }
 
   void cap_hit() {
     ++cap_hits;
@@ -751,10 +781,14 @@ public:
 
   xlist<Inode*> &get_dirty_list() { return dirty_list; }
 
-  /* timer_lock for 'timer' and 'tick_event' */
+  /* timer_lock for 'timer' */
   ceph::mutex timer_lock = ceph::make_mutex("Client::timer_lock");
-  Context *tick_event = nullptr;
   SafeTimer timer;
+
+  /* tick thread */
+  std::thread upkeeper;
+  ceph::condition_variable upkeep_cond;
+  bool tick_thread_stopped = false;
 
   std::unique_ptr<PerfCounters> logger;
   std::unique_ptr<MDSMap> mdsmap;
@@ -1140,9 +1174,11 @@ private:
 
   /* Flags for VXattr */
   static const unsigned VXATTR_RSTAT = 0x1;
+  static const unsigned VXATTR_DIRSTAT = 0x2;
 
   static const VXattr _dir_vxattrs[];
   static const VXattr _file_vxattrs[];
+  static const VXattr _common_vxattrs[];
 
 
 
@@ -1174,6 +1210,8 @@ private:
   int _read_sync(Fh *f, uint64_t off, uint64_t len, bufferlist *bl, bool *checkeof);
   int _read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl);
 
+  bool _dentry_valid(const Dentry *dn);
+
   // internal interface
   //   call these with client_lock held!
   int _do_lookup(Inode *dir, const string& name, int mask, InodeRef *target,
@@ -1187,7 +1225,7 @@ private:
   int _unlink(Inode *dir, const char *name, const UserPerm& perm);
   int _rename(Inode *olddir, const char *oname, Inode *ndir, const char *nname, const UserPerm& perm);
   int _mkdir(Inode *dir, const char *name, mode_t mode, const UserPerm& perm,
-	     InodeRef *inp = 0);
+	     InodeRef *inp = 0, const std::map<std::string, std::string> &metadata={});
   int _rmdir(Inode *dir, const char *name, const UserPerm& perms);
   int _symlink(Inode *dir, const char *name, const char *target,
 	       const UserPerm& perms, InodeRef *inp = 0);
@@ -1297,6 +1335,9 @@ private:
 
   bool _vxattrcb_mirror_info_exists(Inode *in);
   size_t _vxattrcb_mirror_info(Inode *in, char *val, size_t size);
+
+  size_t _vxattrcb_cluster_fsid(Inode *in, char *val, size_t size);
+  size_t _vxattrcb_client_id(Inode *in, char *val, size_t size);
 
   static const VXattr *_get_vxattrs(Inode *in);
   static const VXattr *_match_vxattr(Inode *in, const char *name);
@@ -1421,6 +1462,11 @@ private:
   int reclaim_errno = 0;
   epoch_t reclaim_osd_epoch = 0;
   entity_addrvec_t reclaim_target_addrs;
+
+  // dentry lease metrics
+  uint64_t dentry_nr = 0;
+  uint64_t dlease_hits = 0;
+  uint64_t dlease_misses = 0;
 
   uint64_t cap_hits = 0;
   uint64_t cap_misses = 0;

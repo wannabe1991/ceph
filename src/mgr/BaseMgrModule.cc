@@ -125,10 +125,18 @@ ceph_send_command(BaseMgrModule *self, PyObject *args)
 
   char *cmd_json = nullptr;
   char *tag = nullptr;
+  char *inbuf_ptr = nullptr;
+  Py_ssize_t inbuf_len = 0;
+  bufferlist inbuf = {};
+
   PyObject *completion = nullptr;
-  if (!PyArg_ParseTuple(args, "Ossss:ceph_send_command",
-        &completion, &type, &name, &cmd_json, &tag)) {
+  if (!PyArg_ParseTuple(args, "Ossssz#:ceph_send_command",
+        &completion, &type, &name, &cmd_json, &tag, &inbuf_ptr, &inbuf_len)) {
     return nullptr;
+  }
+
+  if (inbuf_ptr) {
+    inbuf.append(inbuf_ptr, (unsigned)inbuf_len);
   }
 
   auto set_fn = PyObject_GetAttrString(completion, "complete");
@@ -163,7 +171,7 @@ ceph_send_command(BaseMgrModule *self, PyObject *args)
     self->py_modules->get_monc().start_mon_command(
         name,
         {cmd_json},
-        {},
+        inbuf,
         &command_c->outbl,
         &command_c->outs,
         new C_OnFinisher(c, &self->py_modules->cmd_finisher));
@@ -183,7 +191,7 @@ ceph_send_command(BaseMgrModule *self, PyObject *args)
     self->py_modules->get_objecter().osd_command(
         osd_id,
         {cmd_json},
-        {},
+        inbuf,
         &tid,
 	[command_c, f = &self->py_modules->cmd_finisher]
 	(boost::system::error_code ec, std::string s, ceph::buffer::list bl) {
@@ -195,7 +203,7 @@ ceph_send_command(BaseMgrModule *self, PyObject *args)
     int r = self->py_modules->get_client().mds_command(
         name,
         {cmd_json},
-        {},
+        inbuf,
         &command_c->outbl,
         &command_c->outs,
         new C_OnFinisher(command_c, &self->py_modules->cmd_finisher));
@@ -221,7 +229,7 @@ ceph_send_command(BaseMgrModule *self, PyObject *args)
     self->py_modules->get_objecter().pg_command(
         pgid,
         {cmd_json},
-        {},
+        inbuf,
         &tid,
 	[command_c, f = &self->py_modules->cmd_finisher]
 	(boost::system::error_code ec, std::string s, ceph::buffer::list bl) {
@@ -354,7 +362,7 @@ ceph_set_health_checks(BaseMgrModule *self, PyObject *args)
   self->py_modules->set_health_checks(self->this_module->get_name(),
                                       std::move(out_checks));
   PyEval_RestoreThread(tstate);
-  
+
   Py_RETURN_NONE;
 }
 
@@ -675,13 +683,14 @@ ceph_update_progress_event(BaseMgrModule *self, PyObject *args)
   char *evid = nullptr;
   char *desc = nullptr;
   float progress = 0.0;
-  if (!PyArg_ParseTuple(args, "ssf:ceph_update_progress_event",
-			&evid, &desc, &progress)) {
+  bool add_to_ceph_s = false;
+  if (!PyArg_ParseTuple(args, "ssfb:ceph_update_progress_event",
+			&evid, &desc, &progress, &add_to_ceph_s)) {
     return nullptr;
   }
 
   PyThreadState *tstate = PyEval_SaveThread();
-  self->py_modules->update_progress_event(evid, desc, progress);
+  self->py_modules->update_progress_event(evid, desc, progress, add_to_ceph_s);
   PyEval_RestoreThread(tstate);
 
   Py_RETURN_NONE;
@@ -1046,6 +1055,7 @@ ceph_add_mds_perf_query(BaseMgrModule *self, PyObject *args)
     {"read_latency", MDSPerformanceCounterType::READ_LATENCY_METRIC},
     {"write_latency", MDSPerformanceCounterType::WRITE_LATENCY_METRIC},
     {"metadata_latency", MDSPerformanceCounterType::METADATA_LATENCY_METRIC},
+    {"dentry_lease", MDSPerformanceCounterType::DENTRY_LEASE_METRIC},
   };
 
   PyObject *py_query = nullptr;

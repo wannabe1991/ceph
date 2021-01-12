@@ -1,4 +1,3 @@
-import datetime
 import errno
 import json
 from typing import List, Set, Optional, Iterator, cast, Dict, Any, Union
@@ -11,13 +10,14 @@ from prettytable import PrettyTable
 from ceph.deployment.inventory import Device
 from ceph.deployment.drive_group import DriveGroupSpec, DeviceSelection
 from ceph.deployment.service_spec import PlacementSpec, ServiceSpec
+from ceph.utils import datetime_now
 
 from mgr_util import format_bytes, to_pretty_timedelta, format_dimless
-from mgr_module import MgrModule, HandleCommandResult
+from mgr_module import MgrModule, HandleCommandResult, Option
 
 from ._interface import OrchestratorClientMixin, DeviceLightLoc, _cli_read_command, \
     raise_if_exception, _cli_write_command, TrivialReadCompletion, OrchestratorError, \
-    NoOrchestrator, OrchestratorValidationError, NFSServiceSpec, \
+    NoOrchestrator, OrchestratorValidationError, NFSServiceSpec, HA_RGWSpec, \
     RGWSpec, InventoryFilter, InventoryHost, HostSpec, CLICommandMeta, \
     ServiceDescription, DaemonDescription, IscsiServiceSpec, json_to_generic_spec, GenericSpec
 
@@ -70,14 +70,26 @@ def to_format(what, format: str, many: bool, cls):
         raise OrchestratorError(f'unsupported format type: {format}')
 
 
-def generate_preview_tables(data):
+def generate_preview_tables(data, osd_only=False):
     error = [x.get('error') for x in data if x.get('error')]
     if error:
         return json.dumps(error)
     warning = [x.get('warning') for x in data if x.get('warning')]
     osd_table = preview_table_osd(data)
     service_table = preview_table_services(data)
-    tables = f"""
+
+    if osd_only:
+        tables = f"""
+{''.join(warning)}
+
+################
+OSDSPEC PREVIEWS
+################
+{osd_table}
+"""
+        return tables
+    else:
+        tables = f"""
 {''.join(warning)}
 
 ####################
@@ -90,7 +102,7 @@ OSDSPEC PREVIEWS
 ################
 {osd_table}
 """
-    return tables
+        return tables
 
 
 def preview_table_osd(data):
@@ -135,15 +147,14 @@ def preview_table_services(data):
 class OrchestratorCli(OrchestratorClientMixin, MgrModule,
                       metaclass=CLICommandMeta):
     MODULE_OPTIONS = [
-        {
-            'name': 'orchestrator',
-            'type': 'str',
-            'default': None,
-            'desc': 'Orchestrator backend',
-            'enum_allowed': ['cephadm', 'rook',
-                             'test_orchestrator'],
-            'runtime': True,
-        },
+        Option(
+            'orchestrator',
+            type='str',
+            default=None,
+            desc='Orchestrator backend',
+            enum_allowed=['cephadm', 'rook', 'test_orchestrator'],
+            runtime=True,
+        )
     ]
     NATIVE_OPTIONS = []  # type: List[dict]
 
@@ -318,7 +329,8 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
             table.left_padding_width = 0
             table.right_padding_width = 2
             for host in sorted(completion.result, key=lambda h: h.hostname):
-                table.add_row((host.hostname, host.addr, ' '.join(host.labels), host.status))
+                table.add_row((host.hostname, host.addr, ' '.join(
+                    host.labels), host.status.capitalize()))
             output = table.get_string()
         return HandleCommandResult(stdout=output)
 
@@ -352,6 +364,28 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
         completion = self.host_ok_to_stop(hostname)
         self._orchestrator_wait([completion])
         raise_if_exception(completion)
+        return HandleCommandResult(stdout=completion.result_str())
+
+    @_cli_write_command(
+        'orch host maintenance enter',
+        'name=hostname,type=CephString',
+        desc='Prepare a host for maintenance by shutting down and disabling all Ceph daemons (cephadm only)')
+    def _host_maintenance_enter(self, hostname: str):
+        completion = self.enter_host_maintenance(hostname)
+        self._orchestrator_wait([completion])
+        raise_if_exception(completion)
+
+        return HandleCommandResult(stdout=completion.result_str())
+
+    @_cli_write_command(
+        'orch host maintenance exit',
+        'name=hostname,type=CephString',
+        desc='Return a host from maintenance, restarting all Ceph daemons (cephadm only)')
+    def _host_maintenance_exit(self, hostname: str):
+        completion = self.exit_host_maintenance(hostname)
+        self._orchestrator_wait([completion])
+        raise_if_exception(completion)
+
         return HandleCommandResult(stdout=completion.result_str())
 
     @_cli_read_command(
@@ -405,7 +439,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
             table._align['SIZE'] = 'r'
             table.left_padding_width = 0
             table.right_padding_width = 2
-            for host_ in completion.result:  # type: InventoryHost
+            for host_ in sorted(completion.result, key=lambda h: h.name):  # type: InventoryHost
                 for d in host_.devices.devices:  # type: Device
 
                     led_ident = 'N/A'
@@ -504,7 +538,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
             else:
                 return HandleCommandResult(stdout=to_format(services, format, many=True, cls=ServiceDescription))
         else:
-            now = datetime.datetime.utcnow()
+            now = datetime_now()
             table = PrettyTable(
                 ['NAME', 'RUNNING', 'REFRESHED', 'AGE',
                  'PLACEMENT',
@@ -569,7 +603,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
             if len(daemons) == 0:
                 return HandleCommandResult(stdout="No daemons reported")
 
-            now = datetime.datetime.utcnow()
+            now = datetime_now()
             table = PrettyTable(
                 ['NAME', 'HOST', 'STATUS', 'REFRESHED', 'AGE',
                  'VERSION', 'IMAGE NAME', 'IMAGE ID', 'CONTAINER ID'],
@@ -601,6 +635,18 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
                     ukn(s.container_image_id)[0:12],
                     ukn(s.container_id)))
 
+            remove_column = 'CONTAINER ID'
+            if table.get_string(fields=[remove_column], border=False,
+                                header=False).count('<unknown>') == len(daemons):
+                try:
+                    table.del_column(remove_column)
+                except AttributeError as e:
+                    # del_column method was introduced in prettytable 2.0
+                    if str(e) != "del_column":
+                        raise
+                    table.field_names.remove(remove_column)
+                    table._rows = [row[:-1] for row in table._rows]
+
             return HandleCommandResult(stdout=table.get_string())
 
     @_cli_write_command(
@@ -621,38 +667,38 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
 usage:
   ceph orch apply osd -i <json_file/yaml_file> [--dry-run]
   ceph orch apply osd --all-available-devices [--dry-run] [--unmanaged]
-  
+
 Restrictions:
-  
+
   Mutexes:
   * -i, --all-available-devices
   * -i, --unmanaged (this would overwrite the osdspec loaded from a file)
-  
+
   Parameters:
-  
+
   * --unmanaged
      Only works with --all-available-devices.
-  
+
 Description:
-  
+
   * -i
     An inbuf object like a file or a json/yaml blob containing a valid OSDSpec
-    
+
   * --all-available-devices
     The most simple OSDSpec there is. Takes all as 'available' marked devices
     and creates standalone OSDs on them.
-    
+
   * --unmanaged
     Set a the unmanaged flag for all--available-devices (default is False)
-    
+
 Examples:
 
    # ceph orch apply osd -i <file.yml|json>
-   
+
    Applies one or more OSDSpecs found in <file>
-   
+
    # ceph orch osd apply --all-available-devices --unmanaged=true
-   
+
    Creates and applies simple OSDSpec with the unmanaged flag set to <true>
 """
 
@@ -667,34 +713,36 @@ Examples:
         if inbuf:
             if unmanaged is not None:
                 return HandleCommandResult(-errno.EINVAL, stderr=usage)
+
             try:
-                drivegroups = yaml.safe_load_all(inbuf)
+                drivegroups = [_dg for _dg in yaml.safe_load_all(inbuf)]
+            except yaml.scanner.ScannerError as e:
+                msg = f"Invalid YAML received : {str(e)}"
+                self.log.exception(e)
+                return HandleCommandResult(-errno.EINVAL, stderr=msg)
 
-                dg_specs = []
-                for dg in drivegroups:
-                    spec = DriveGroupSpec.from_json(dg)
-                    if dry_run:
-                        spec.preview_only = True
-                    dg_specs.append(spec)
+            dg_specs = []
+            for dg in drivegroups:
+                spec = DriveGroupSpec.from_json(dg)
+                if dry_run:
+                    spec.preview_only = True
+                dg_specs.append(spec)
 
-                completion = self.apply(dg_specs)
+            completion = self.apply(dg_specs)
+            self._orchestrator_wait([completion])
+            raise_if_exception(completion)
+            out = completion.result_str()
+            if dry_run:
+                completion = self.plan(dg_specs)
                 self._orchestrator_wait([completion])
                 raise_if_exception(completion)
-                out = completion.result_str()
-                if dry_run:
-                    completion = self.plan(dg_specs)
-                    self._orchestrator_wait([completion])
-                    raise_if_exception(completion)
-                    data = completion.result
-                    if format == 'plain':
-                        out = preview_table_osd(data)
-                    else:
-                        out = to_format(data, format, many=True, cls=None)
-                return HandleCommandResult(stdout=out)
+                data = completion.result
+                if format == 'plain':
+                    out = generate_preview_tables(data, True)
+                else:
+                    out = to_format(data, format, many=True, cls=None)
+            return HandleCommandResult(stdout=out)
 
-            except ValueError as e:
-                msg = 'Failed to read JSON/YAML input: {}'.format(str(e)) + usage
-                return HandleCommandResult(-errno.EINVAL, stderr=msg)
         if all_available_devices:
             if unmanaged is None:
                 unmanaged = False
@@ -717,7 +765,7 @@ Examples:
                 self._orchestrator_wait([completion])
                 data = completion.result
                 if format == 'plain':
-                    out = preview_table_osd(data)
+                    out = generate_preview_tables(data, True)
                 else:
                     out = to_format(data, format, many=True, cls=None)
             return HandleCommandResult(stdout=out)
@@ -809,7 +857,7 @@ Usage:
 
     @_cli_write_command(
         'orch daemon add',
-        'name=daemon_type,type=CephChoices,strings=mon|mgr|rbd-mirror|crash|alertmanager|grafana|node-exporter|prometheus,req=false '
+        'name=daemon_type,type=CephChoices,strings=mon|mgr|rbd-mirror|crash|alertmanager|grafana|node-exporter|prometheus|cephadm-exporter,req=false '
         'name=placement,type=CephString,req=false',
         'Add daemon(s)')
     def _daemon_add_misc(self,
@@ -854,6 +902,8 @@ Usage:
             completion = self.add_nfs(spec)
         elif daemon_type == 'iscsi':
             completion = self.add_iscsi(spec)
+        elif daemon_type == 'cephadm-exporter':
+            completion = self.add_cephadm_exporter(spec)
         else:
             raise OrchestratorValidationError(f'unknown daemon type `{daemon_type}`')
 
@@ -1048,7 +1098,7 @@ Usage:
 
     @_cli_write_command(
         'orch apply',
-        'name=service_type,type=CephChoices,strings=mon|mgr|rbd-mirror|crash|alertmanager|grafana|node-exporter|prometheus,req=false '
+        'name=service_type,type=CephChoices,strings=mon|mgr|rbd-mirror|crash|alertmanager|grafana|node-exporter|prometheus|cephadm-exporter,req=false '
         'name=placement,type=CephString,req=false '
         'name=dry_run,type=CephBool,req=false '
         'name=format,type=CephChoices,strings=plain|json|json-pretty|yaml,req=false '

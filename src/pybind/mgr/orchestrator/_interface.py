@@ -22,9 +22,10 @@ import yaml
 
 from ceph.deployment import inventory
 from ceph.deployment.service_spec import ServiceSpec, NFSServiceSpec, RGWSpec, \
-    ServiceSpecValidationError, IscsiServiceSpec
+    ServiceSpecValidationError, IscsiServiceSpec, HA_RGWSpec
 from ceph.deployment.drive_group import DriveGroupSpec
 from ceph.deployment.hostspec import HostSpec
+from ceph.utils import datetime_to_str, str_to_datetime
 
 from mgr_module import MgrModule, CLICommand, HandleCommandResult
 
@@ -35,8 +36,6 @@ except ImportError:
     pass
 
 logger = logging.getLogger(__name__)
-
-DATEFMT = '%Y-%m-%dT%H:%M:%S.%f'
 
 T = TypeVar('T')
 
@@ -829,6 +828,18 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
+    def enter_host_maintenance(self, hostname: str) -> Completion:
+        """
+        Place a host in maintenance, stopping daemons and disabling it's systemd target
+        """
+        raise NotImplementedError()
+
+    def exit_host_maintenance(self, hostname: str) -> Completion:
+        """
+        Return a host from maintenance, restarting the clusters systemd target
+        """
+        raise NotImplementedError()
+
     def get_inventory(self, host_filter: Optional['InventoryFilter'] = None, refresh: bool = False) -> Completion[List['InventoryHost']]:
         """
         Returns something that was created by `ceph-volume inventory`.
@@ -878,7 +889,9 @@ class Orchestrator(object):
             'prometheus': self.apply_prometheus,
             'rbd-mirror': self.apply_rbd_mirror,
             'rgw': self.apply_rgw,
+            'ha-rgw': self.apply_ha_rgw,
             'host': self.add_host,
+            'cephadm-exporter': self.apply_cephadm_exporter,
         }
 
         def merge(ls, r):
@@ -1043,6 +1056,10 @@ class Orchestrator(object):
         """Update RGW cluster"""
         raise NotImplementedError()
 
+    def apply_ha_rgw(self, spec: HA_RGWSpec) -> Completion[str]:
+        """Update ha-rgw daemons"""
+        raise NotImplementedError()
+
     def add_rbd_mirror(self, spec: ServiceSpec) -> Completion[List[str]]:
         """Create rbd-mirror daemon(s)"""
         raise NotImplementedError()
@@ -1092,11 +1109,11 @@ class Orchestrator(object):
         raise NotImplementedError()
 
     def add_grafana(self, spec: ServiceSpec) -> Completion[List[str]]:
-        """Create a new Node-Exporter service"""
+        """Create a new grafana service"""
         raise NotImplementedError()
 
     def apply_grafana(self, spec: ServiceSpec) -> Completion[str]:
-        """Update existing a Node-Exporter daemon(s)"""
+        """Update existing a grafana service"""
         raise NotImplementedError()
 
     def add_alertmanager(self, spec: ServiceSpec) -> Completion[List[str]]:
@@ -1105,6 +1122,14 @@ class Orchestrator(object):
 
     def apply_alertmanager(self, spec: ServiceSpec) -> Completion[str]:
         """Update an existing AlertManager daemon(s)"""
+        raise NotImplementedError()
+
+    def add_cephadm_exporter(self, spec: ServiceSpec) -> Completion[List[str]]:
+        """Create a new cephadm exporter daemon"""
+        raise NotImplementedError()
+
+    def apply_cephadm_exporter(self, spec: ServiceSpec) -> Completion[str]:
+        """Update an existing cephadm exporter daemon"""
         raise NotImplementedError()
 
     def upgrade_check(self, image: Optional[str], version: Optional[str]) -> Completion[str]:
@@ -1149,6 +1174,51 @@ def json_to_generic_spec(spec: dict) -> GenericSpec:
         return HostSpec.from_json(spec)
     else:
         return ServiceSpec.from_json(spec)
+
+
+def daemon_type_to_service(dtype: str) -> str:
+    mapping = {
+        'mon': 'mon',
+        'mgr': 'mgr',
+        'mds': 'mds',
+        'rgw': 'rgw',
+        'osd': 'osd',
+        'haproxy': 'ha-rgw',
+        'keepalived': 'ha-rgw',
+        'iscsi': 'iscsi',
+        'rbd-mirror': 'rbd-mirror',
+        'nfs': 'nfs',
+        'grafana': 'grafana',
+        'alertmanager': 'alertmanager',
+        'prometheus': 'prometheus',
+        'node-exporter': 'node-exporter',
+        'crash': 'crash',
+        'container': 'container',
+        'cephadm-exporter': 'cephadm-exporter',
+    }
+    return mapping[dtype]
+
+
+def service_to_daemon_types(stype: str) -> List[str]:
+    mapping = {
+        'mon': ['mon'],
+        'mgr': ['mgr'],
+        'mds': ['mds'],
+        'rgw': ['rgw'],
+        'osd': ['osd'],
+        'ha-rgw': ['haproxy', 'keepalived'],
+        'iscsi': ['iscsi'],
+        'rbd-mirror': ['rbd-mirror'],
+        'nfs': ['nfs'],
+        'grafana': ['grafana'],
+        'alertmanager': ['alertmanager'],
+        'prometheus': ['prometheus'],
+        'node-exporter': ['node-exporter'],
+        'crash': ['crash'],
+        'container': ['container'],
+        'cephadm-exporter': ['cephadm-exporter'],
+    }
+    return mapping[stype]
 
 
 class UpgradeStatusSpec(object):
@@ -1216,6 +1286,8 @@ class DaemonDescription(object):
         # The type of service (osd, mon, mgr, etc.)
         self.daemon_type = daemon_type
 
+        assert daemon_type not in ['HA_RGW', 'ha-rgw']
+
         # The orchestrator will have picked some names for daemons,
         # typically either based on hostnames or on pod names.
         # This is the <foo> in mds.<foo>, the ID that will appear
@@ -1251,7 +1323,7 @@ class DaemonDescription(object):
 
     def matches_service(self, service_name: Optional[str]) -> bool:
         if service_name:
-            return self.name().startswith(service_name + '.')
+            return (daemon_type_to_service(self.daemon_type) + '.' + self.daemon_id).startswith(service_name + '.')
         return False
 
     def service_id(self):
@@ -1298,15 +1370,15 @@ class DaemonDescription(object):
             # daemon_id == "service_id"
             return self.daemon_id
 
-        if self.daemon_type in ServiceSpec.REQUIRES_SERVICE_ID:
+        if daemon_type_to_service(self.daemon_type) in ServiceSpec.REQUIRES_SERVICE_ID:
             return _match()
 
         return self.daemon_id
 
     def service_name(self):
-        if self.daemon_type in ServiceSpec.REQUIRES_SERVICE_ID:
-            return f'{self.daemon_type}.{self.service_id()}'
-        return self.daemon_type
+        if daemon_type_to_service(self.daemon_type) in ServiceSpec.REQUIRES_SERVICE_ID:
+            return f'{daemon_type_to_service(self.daemon_type)}.{self.service_id()}'
+        return daemon_type_to_service(self.daemon_type)
 
     def __repr__(self):
         return "<DaemonDescription>({type}.{id})".format(type=self.daemon_type,
@@ -1330,7 +1402,7 @@ class DaemonDescription(object):
         for k in ['last_refresh', 'created', 'started', 'last_deployed',
                   'last_configured']:
             if getattr(self, k):
-                out[k] = getattr(self, k).strftime(DATEFMT)
+                out[k] = datetime_to_str(getattr(self, k))
 
         if self.events:
             out['events'] = [e.to_json() for e in self.events]
@@ -1348,7 +1420,7 @@ class DaemonDescription(object):
         for k in ['last_refresh', 'created', 'started', 'last_deployed',
                   'last_configured']:
             if k in c:
-                c[k] = datetime.datetime.strptime(c[k], DATEFMT)
+                c[k] = str_to_datetime(c[k])
         events = [OrchestratorEvent.from_json(e) for e in event_strs]
         return cls(events=events, **c)
 
@@ -1436,7 +1508,7 @@ class ServiceDescription(object):
         }
         for k in ['last_refresh', 'created']:
             if getattr(self, k):
-                status[k] = getattr(self, k).strftime(DATEFMT)
+                status[k] = datetime_to_str(getattr(self, k))
         status = {k: v for (k, v) in status.items() if v is not None}
         out['status'] = status
         if self.events:
@@ -1454,7 +1526,7 @@ class ServiceDescription(object):
         c_status = status.copy()
         for k in ['last_refresh', 'created']:
             if k in c_status:
-                c_status[k] = datetime.datetime.strptime(c_status[k], DATEFMT)
+                c_status[k] = str_to_datetime(c_status[k])
         events = [OrchestratorEvent.from_json(e) for e in event_strs]
         return cls(spec=spec, events=events, **c_status)
 
@@ -1574,7 +1646,7 @@ class OrchestratorEvent:
 
     def __init__(self, created: Union[str, datetime.datetime], kind, subject, level, message):
         if isinstance(created, str):
-            created = datetime.datetime.strptime(created, DATEFMT)
+            created = str_to_datetime(created)
         self.created: datetime.datetime = created
 
         assert kind in "service daemon".split()
@@ -1596,7 +1668,7 @@ class OrchestratorEvent:
 
     def to_json(self) -> str:
         # Make a long list of events readable.
-        created = self.created.strftime(DATEFMT)
+        created = datetime_to_str(self.created)
         return f'{created} {self.kind_subject()} [{self.level}] "{self.message}"'
 
     @classmethod
@@ -1604,7 +1676,7 @@ class OrchestratorEvent:
     def from_json(cls, data) -> "OrchestratorEvent":
         """
         >>> OrchestratorEvent.from_json('''2020-06-10T10:20:25.691255 daemon:crash.ubuntu [INFO] "Deployed crash.ubuntu on host 'ubuntu'"''').to_json()
-        '2020-06-10T10:20:25.691255 daemon:crash.ubuntu [INFO] "Deployed crash.ubuntu on host \\'ubuntu\\'"'
+        '2020-06-10T10:20:25.691255Z daemon:crash.ubuntu [INFO] "Deployed crash.ubuntu on host \\'ubuntu\\'"'
 
         :param data:
         :return:

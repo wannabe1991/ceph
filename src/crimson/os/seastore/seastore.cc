@@ -15,7 +15,7 @@
 
 #include "crimson/os/futurized_collection.h"
 
-#include "crimson/os/seastore/segment_manager.h"
+#include "crimson/os/seastore/segment_manager/ephemeral.h"
 #include "crimson/os/seastore/transaction_manager.h"
 #include "crimson/os/seastore/onode_manager.h"
 #include "crimson/os/seastore/cache.h"
@@ -37,8 +37,7 @@ struct SeastoreCollection final : public FuturizedCollection {
 };
 
 SeaStore::SeaStore(const std::string& path)
-  : segment_manager(segment_manager::create_ephemeral(
-		      segment_manager::DEFAULT_TEST_EPHEMERAL)),
+  : segment_manager(segment_manager::create_test_ephemeral() /* TODO */),
     segment_cleaner(
       std::make_unique<SegmentCleaner>(
 	SegmentCleaner::config_t::default_from_segment_manager(
@@ -171,9 +170,11 @@ seastar::future<struct stat> SeaStore::stat(
   return seastar::make_ready_future<struct stat>(st);
 }
 
-seastar::future<ceph::bufferlist> omap_get_header(
+auto
+SeaStore::omap_get_header(
   CollectionRef c,
   const ghobject_t& oid)
+  -> read_errorator::future<bufferlist>
 {
   return seastar::make_ready_future<bufferlist>();
 }

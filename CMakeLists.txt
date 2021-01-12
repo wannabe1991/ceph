@@ -13,7 +13,9 @@ foreach(policy
     CMP0054
     CMP0056
     CMP0065
-    CMP0075)
+    CMP0074
+    CMP0075
+    CMP0093)
   if(POLICY ${policy})
     cmake_policy(SET ${policy} NEW)
   endif()
@@ -192,12 +194,25 @@ if(WITH_BLUESTORE)
   endif()
 endif()
 
+# libcryptsetup is only available on linux
+if(WITH_RBD AND LINUX)
+  find_package(libcryptsetup REQUIRED)
+  set(HAVE_LIBCRYPTSETUP ${LIBCRYPTSETUP_FOUND})
+  if(${LIBCRYPTSETUP_VERSION} VERSION_LESS 2.0.5)
+    set(LIBCRYPTSETUP_LEGACY_DATA_ALIGNMENT TRUE)
+  endif()
+endif()
+
 include(CMakeDependentOption)
 
 CMAKE_DEPENDENT_OPTION(WITH_ZBD "Enable libzbd bluestore backend" OFF
   "WITH_BLUESTORE" OFF)
+if(WITH_ZBD)
+  find_package(zbd REQUIRED)
+  set(HAVE_LIBZBD ${ZBD_FOUND})
+endif()
 
-CMAKE_DEPENDENT_OPTION(WITH_LIBURING "Enable io_uring bluestore backend" OFF
+CMAKE_DEPENDENT_OPTION(WITH_LIBURING "Enable io_uring bluestore backend" ON
   "WITH_BLUESTORE;HAVE_LIBAIO" OFF)
 set(HAVE_LIBURING ${WITH_LIBURING})
 
@@ -209,6 +224,9 @@ CMAKE_DEPENDENT_OPTION(WITH_BLUESTORE_PMEM "Enable PMDK libraries" OFF
 
 CMAKE_DEPENDENT_OPTION(WITH_RBD_RWL "Enable librbd persistent write back cache" OFF
   "WITH_RBD" OFF)
+
+CMAKE_DEPENDENT_OPTION(WITH_RBD_SSD_CACHE "Enable librbd persistent write back cache for SSDs" OFF
+    "WITH_RBD" OFF)
 
 CMAKE_DEPENDENT_OPTION(WITH_SYSTEM_PMDK "Require and build with system PMDK" OFF
   "WITH_RBD_RWL OR WITH_BLUESTORE_PMEM" OFF)
@@ -357,6 +375,11 @@ if(WITH_BLKIN)
   include_directories(SYSTEM src/blkin/blkin-lib)
 endif(WITH_BLKIN)
 
+option(WITH_JAEGER "Enable jaegertracing and it's dependent libraries" OFF)
+if(WITH_JAEGER)
+  set(HAVE_JAEGER TRUE)
+endif()
+
 #option for RGW
 option(WITH_RADOSGW "Rados Gateway is enabled" ON)
 option(WITH_RADOSGW_FCGI_FRONTEND "Rados Gateway's FCGI frontend is enabled" OFF)
@@ -364,6 +387,7 @@ option(WITH_RADOSGW_BEAST_FRONTEND "Rados Gateway's Beast frontend is enabled" O
 option(WITH_RADOSGW_BEAST_OPENSSL "Rados Gateway's Beast frontend uses OpenSSL" ON)
 option(WITH_RADOSGW_AMQP_ENDPOINT "Rados Gateway's pubsub support for AMQP push endpoint" ON)
 option(WITH_RADOSGW_KAFKA_ENDPOINT "Rados Gateway's pubsub support for Kafka push endpoint" ON)
+option(WITH_RADOSGW_LUA_PACKAGES "Rados Gateway's support for dynamically adding lua packagess" ON)
 
 if(WITH_RADOSGW)
   find_package(EXPAT REQUIRED)
@@ -424,6 +448,7 @@ endif (WITH_RADOSGW)
 #option for CephFS
 option(WITH_CEPHFS "CephFS is enabled" ON)
 
+if(NOT WIN32)
 # Please specify 3.[0-7] if you want to build with a certain version of python3.
 set(WITH_PYTHON3 "3" CACHE STRING "build with specified python3 version")
 if(NOT WITH_PYTHON3 STREQUAL "3")
@@ -446,6 +471,7 @@ if(WITH_MGR)
   endif()
   # Boost dependency check deferred to Boost section
 endif(WITH_MGR)
+endif(NOT WIN32)
 
 option(WITH_THREAD_SAFE_RES_QUERY "res_query is thread safe" OFF)
 if(WITH_THREAD_SAFE_RES_QUERY)
@@ -499,14 +525,7 @@ set(CEPH_TEST_TIMEOUT 3600 CACHE STRING
 
 # fio
 option(WITH_FIO "build with fio plugin enabled" OFF)
-option(WITH_SYSTEM_FIO "require and build with system fio" OFF)
-if(WITH_SYSTEM_FIO)
-  find_package(fio REQUIRED)
-elseif(WITH_FIO)
-  if (NOT FIO_INCLUDE_DIR)
-    # Use local external fio if include directory is not set
-    set(FIO_INCLUDE_DIR ${CMAKE_BINARY_DIR}/src/fio)
-  endif()
+if(WITH_FIO)
   include(BuildFIO)
   build_fio()
 endif()
@@ -559,7 +578,7 @@ option(WITH_SYSTEM_BOOST "require and build with system Boost" OFF)
 # Boost::thread depends on Boost::atomic, so list it explicitly.
 set(BOOST_COMPONENTS
   atomic chrono thread system regex random program_options date_time
-  iostreams context coroutine)
+  iostreams context coroutine filesystem)
 set(BOOST_HEADER_COMPONENTS container)
 
 if(WITH_MGR)
@@ -567,7 +586,11 @@ if(WITH_MGR)
     python${MGR_PYTHON_VERSION_MAJOR}${MGR_PYTHON_VERSION_MINOR})
 endif()
 if(WITH_SEASTAR)
-  list(APPEND BOOST_COMPONENTS filesystem timer)
+  list(APPEND BOOST_COMPONENTS timer)
+endif()
+
+if(WITH_RADOSGW AND WITH_RADOSGW_LUA_PACKAGES)
+  list(APPEND BOOST_COMPONENTS filesystem)
 endif()
 
 set(Boost_USE_MULTITHREADED ON)
@@ -615,7 +638,7 @@ set(WITH_MGR_ROOK_CLIENT WITH_MGR_DASHBOARD_FRONTEND)
 include_directories(SYSTEM ${PROJECT_BINARY_DIR}/include)
 
 find_package(Threads REQUIRED)
-find_package(StdFilesystem)
+find_package(StdFilesystem REQUIRED)
 
 option(WITH_SELINUX "build SELinux policy" OFF)
 if(WITH_SELINUX)

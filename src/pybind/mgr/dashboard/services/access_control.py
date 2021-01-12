@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from string import ascii_lowercase, ascii_uppercase, digits, punctuation
 
 import bcrypt
-from mgr_module import CLIReadCommand, CLIWriteCommand
+from mgr_module import CLICheckNonemptyFileInput, CLIReadCommand, CLIWriteCommand
 
 from .. import mgr
 from ..exceptions import PasswordPolicyException, PermissionNotValid, \
@@ -290,6 +290,7 @@ class User(object):
         self.password = password
         self.name = name
         self.email = email
+        self.invalid_auth_attempt = 0
         if roles is None:
             self.roles = set()
         else:
@@ -328,6 +329,7 @@ class User(object):
         self.set_password_hash(password_hash(password))
 
     def set_password_hash(self, hashed_password):
+        self.invalid_auth_attempt = 0
         self.password = hashed_password
         self.refresh_last_update()
         self.refresh_pwd_expiration_date()
@@ -431,6 +433,23 @@ class AccessControlDB(object):
             if name not in self.roles:
                 raise RoleDoesNotExist(name)
             return self.roles[name]
+
+    def increment_attempt(self, username):
+        with self.lock:
+            if username in self.users:
+                self.users[username].invalid_auth_attempt += 1
+
+    def reset_attempt(self, username):
+        with self.lock:
+            if username in self.users:
+                self.users[username].invalid_auth_attempt = 0
+
+    def get_attempt(self, username):
+        with self.lock:
+            try:
+                return self.users[username].invalid_auth_attempt
+            except KeyError:
+                return 0
 
     def delete_role(self, name):
         with self.lock:
@@ -561,10 +580,13 @@ def load_access_control_db():
 # CLI dashboard access control scope commands
 
 @CLIWriteCommand('dashboard set-login-credentials',
-                 'name=username,type=CephString '
-                 'name=password,type=CephString',
-                 'Set the login credentials')
-def set_login_credentials_cmd(_, username, password):
+                 'name=username,type=CephString')
+@CLICheckNonemptyFileInput
+def set_login_credentials_cmd(_, username, inbuf):
+    '''
+    Set the login credentials. Password read from -i <file>
+    '''
+    password = inbuf
     try:
         user = mgr.ACCESS_CTRL_DB.get_user(username)
         user.set_password(password)
@@ -583,9 +605,11 @@ Username and password updated''', ''
 
 
 @CLIReadCommand('dashboard ac-role-show',
-                'name=rolename,type=CephString,req=false',
-                'Show role info')
+                'name=rolename,type=CephString,req=false')
 def ac_role_show_cmd(_, rolename=None):
+    '''
+    Show role info
+    '''
     if not rolename:
         roles = dict(mgr.ACCESS_CTRL_DB.roles)
         roles.update(SYSTEM_ROLES)
@@ -602,9 +626,11 @@ def ac_role_show_cmd(_, rolename=None):
 
 @CLIWriteCommand('dashboard ac-role-create',
                  'name=rolename,type=CephString '
-                 'name=description,type=CephString,req=false',
-                 'Create a new access control role')
+                 'name=description,type=CephString,req=false')
 def ac_role_create_cmd(_, rolename, description=None):
+    '''
+    Create a new access control role
+    '''
     try:
         role = mgr.ACCESS_CTRL_DB.create_role(rolename, description)
         mgr.ACCESS_CTRL_DB.save()
@@ -614,9 +640,11 @@ def ac_role_create_cmd(_, rolename, description=None):
 
 
 @CLIWriteCommand('dashboard ac-role-delete',
-                 'name=rolename,type=CephString',
-                 'Delete an access control role')
+                 'name=rolename,type=CephString')
 def ac_role_delete_cmd(_, rolename):
+    '''
+    Delete an access control role
+    '''
     try:
         mgr.ACCESS_CTRL_DB.delete_role(rolename)
         mgr.ACCESS_CTRL_DB.save()
@@ -633,9 +661,11 @@ def ac_role_delete_cmd(_, rolename):
 @CLIWriteCommand('dashboard ac-role-add-scope-perms',
                  'name=rolename,type=CephString '
                  'name=scopename,type=CephString '
-                 'name=permissions,type=CephString,n=N',
-                 'Add the scope permissions for a role')
+                 'name=permissions,type=CephString,n=N')
 def ac_role_add_scope_perms_cmd(_, rolename, scopename, permissions):
+    '''
+    Add the scope permissions for a role
+    '''
     try:
         role = mgr.ACCESS_CTRL_DB.get_role(rolename)
         perms_array = [perm.strip() for perm in permissions]
@@ -659,9 +689,11 @@ def ac_role_add_scope_perms_cmd(_, rolename, scopename, permissions):
 
 @CLIWriteCommand('dashboard ac-role-del-scope-perms',
                  'name=rolename,type=CephString '
-                 'name=scopename,type=CephString',
-                 'Delete the scope permissions for a role')
+                 'name=scopename,type=CephString')
 def ac_role_del_scope_perms_cmd(_, rolename, scopename):
+    '''
+    Delete the scope permissions for a role
+    '''
     try:
         role = mgr.ACCESS_CTRL_DB.get_role(rolename)
         role.del_scope_permissions(scopename)
@@ -678,9 +710,11 @@ def ac_role_del_scope_perms_cmd(_, rolename, scopename):
 
 
 @CLIReadCommand('dashboard ac-user-show',
-                'name=username,type=CephString,req=false',
-                'Show user info')
+                'name=username,type=CephString,req=false')
 def ac_user_show_cmd(_, username=None):
+    '''
+    Show user info
+    '''
     if not username:
         users = mgr.ACCESS_CTRL_DB.users
         users_list = [name for name, _ in users.items()]
@@ -694,18 +728,21 @@ def ac_user_show_cmd(_, username=None):
 
 @CLIWriteCommand('dashboard ac-user-create',
                  'name=username,type=CephString '
-                 'name=password,type=CephString,req=false '
                  'name=rolename,type=CephString,req=false '
                  'name=name,type=CephString,req=false '
                  'name=email,type=CephString,req=false '
                  'name=enabled,type=CephBool,req=false '
                  'name=force_password,type=CephBool,req=false '
                  'name=pwd_expiration_date,type=CephInt,req=false '
-                 'name=pwd_update_required,type=CephBool,req=false',
-                 'Create a user')
-def ac_user_create_cmd(_, username, password=None, rolename=None, name=None,
+                 'name=pwd_update_required,type=CephBool,req=false')
+@CLICheckNonemptyFileInput
+def ac_user_create_cmd(_, username, inbuf, rolename=None, name=None,
                        email=None, enabled=True, force_password=False,
                        pwd_expiration_date=None, pwd_update_required=False):
+    '''
+    Create a user. Password read from -i <file>
+    '''
+    password = inbuf
     try:
         role = mgr.ACCESS_CTRL_DB.get_role(rolename) if rolename else None
     except RoleDoesNotExist as ex:
@@ -732,12 +769,15 @@ def ac_user_create_cmd(_, username, password=None, rolename=None, name=None,
 
 
 @CLIWriteCommand('dashboard ac-user-enable',
-                 'name=username,type=CephString',
-                 'Enable a user')
+                 'name=username,type=CephString')
 def ac_user_enable(_, username):
+    '''
+    Enable a user
+    '''
     try:
         user = mgr.ACCESS_CTRL_DB.get_user(username)
         user.enabled = True
+        mgr.ACCESS_CTRL_DB.reset_attempt(username)
 
         mgr.ACCESS_CTRL_DB.save()
         return 0, json.dumps(user.to_dict()), ''
@@ -746,9 +786,11 @@ def ac_user_enable(_, username):
 
 
 @CLIWriteCommand('dashboard ac-user-disable',
-                 'name=username,type=CephString',
-                 'Disable a user')
+                 'name=username,type=CephString')
 def ac_user_disable(_, username):
+    '''
+    Disable a user
+    '''
     try:
         user = mgr.ACCESS_CTRL_DB.get_user(username)
         user.enabled = False
@@ -760,9 +802,11 @@ def ac_user_disable(_, username):
 
 
 @CLIWriteCommand('dashboard ac-user-delete',
-                 'name=username,type=CephString',
-                 'Delete user')
+                 'name=username,type=CephString')
 def ac_user_delete_cmd(_, username):
+    '''
+    Delete user
+    '''
     try:
         mgr.ACCESS_CTRL_DB.delete_user(username)
         mgr.ACCESS_CTRL_DB.save()
@@ -773,9 +817,11 @@ def ac_user_delete_cmd(_, username):
 
 @CLIWriteCommand('dashboard ac-user-set-roles',
                  'name=username,type=CephString '
-                 'name=roles,type=CephString,n=N',
-                 'Set user roles')
+                 'name=roles,type=CephString,n=N')
 def ac_user_set_roles_cmd(_, username, roles):
+    '''
+    Set user roles
+    '''
     rolesname = roles
     roles = []
     for rolename in rolesname:
@@ -796,9 +842,11 @@ def ac_user_set_roles_cmd(_, username, roles):
 
 @CLIWriteCommand('dashboard ac-user-add-roles',
                  'name=username,type=CephString '
-                 'name=roles,type=CephString,n=N',
-                 'Add roles to user')
+                 'name=roles,type=CephString,n=N')
 def ac_user_add_roles_cmd(_, username, roles):
+    '''
+    Add roles to user
+    '''
     rolesname = roles
     roles = []
     for rolename in rolesname:
@@ -819,9 +867,11 @@ def ac_user_add_roles_cmd(_, username, roles):
 
 @CLIWriteCommand('dashboard ac-user-del-roles',
                  'name=username,type=CephString '
-                 'name=roles,type=CephString,n=N',
-                 'Delete roles from user')
+                 'name=roles,type=CephString,n=N')
 def ac_user_del_roles_cmd(_, username, roles):
+    '''
+    Delete roles from user
+    '''
     rolesname = roles
     roles = []
     for rolename in rolesname:
@@ -844,10 +894,13 @@ def ac_user_del_roles_cmd(_, username, roles):
 
 @CLIWriteCommand('dashboard ac-user-set-password',
                  'name=username,type=CephString '
-                 'name=password,type=CephString '
-                 'name=force_password,type=CephBool,req=false',
-                 'Set user password')
-def ac_user_set_password(_, username, password, force_password=False):
+                 'name=force_password,type=CephBool,req=false')
+@CLICheckNonemptyFileInput
+def ac_user_set_password(_, username, inbuf, force_password=False):
+    '''
+    Set user password from -i <file>
+    '''
+    password = inbuf
     try:
         user = mgr.ACCESS_CTRL_DB.get_user(username)
         if not force_password:
@@ -863,10 +916,13 @@ def ac_user_set_password(_, username, password, force_password=False):
 
 
 @CLIWriteCommand('dashboard ac-user-set-password-hash',
-                 'name=username,type=CephString '
-                 'name=hashed_password,type=CephString',
-                 'Set user password bcrypt hash')
-def ac_user_set_password_hash(_, username, hashed_password):
+                 'name=username,type=CephString')
+@CLICheckNonemptyFileInput
+def ac_user_set_password_hash(_, username, inbuf):
+    '''
+    Set user password bcrypt hash from -i <file>
+    '''
+    hashed_password = inbuf
     try:
         # make sure the hashed_password is actually a bcrypt hash
         bcrypt.checkpw(b'', hashed_password.encode('utf-8'))
@@ -884,9 +940,11 @@ def ac_user_set_password_hash(_, username, hashed_password):
 @CLIWriteCommand('dashboard ac-user-set-info',
                  'name=username,type=CephString '
                  'name=name,type=CephString '
-                 'name=email,type=CephString',
-                 'Set user info')
+                 'name=email,type=CephString')
 def ac_user_set_info(_, username, name, email):
+    '''
+    Set user info
+    '''
     try:
         user = mgr.ACCESS_CTRL_DB.get_user(username)
         if name:

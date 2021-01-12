@@ -173,8 +173,7 @@ target_include_directories(rgw_common SYSTEM PUBLIC "services")
 target_include_directories(rgw_common PUBLIC "${CMAKE_SOURCE_DIR}/src/dmclock/support/src")
 target_include_directories(rgw_common PUBLIC "${CMAKE_SOURCE_DIR}/src/fmt/include")
 target_include_directories(rgw_common PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw")
-target_include_directories(rgw_common PRIVATE "${CMAKE_SOURCE_DIR}/src/lua/src")
-target_include_directories(rgw_common PRIVATE "${CMAKE_BINARY_DIR}/src/lua")
+target_include_directories(rgw_common PRIVATE "${LUA_INCLUDE_DIR}")
 
 
 target_include_directories(rgw_common PRIVATE
@@ -184,6 +183,10 @@ if(WITH_LTTNG)
   # rgw/rgw_op.cc includes "tracing/rgw_op.h"
   # rgw/rgw_rados.cc includes "tracing/rgw_rados.h"
   add_dependencies(rgw_common rgw_op-tp rgw_rados-tp)
+endif()
+
+if(WITH_JAEGER)
+  add_dependencies(rgw_common jaegertracing::libjaegertracing)
 endif()
 
 set(rgw_a_srcs
@@ -256,7 +259,7 @@ if(WITH_CURL_OPENSSL)
   target_link_libraries(rgw_a PRIVATE OpenSSL::Crypto)
 endif()
 
-target_link_libraries(rgw_a PRIVATE liblua)
+target_link_libraries(rgw_a PRIVATE ${LUA_LIBRARIES})
 target_link_libraries(rgw_a PUBLIC spawn)
 
 set(rgw_libs rgw_a)
@@ -270,6 +273,10 @@ if(WITH_RADOSGW_KAFKA_ENDPOINT)
 endif()
 
 list(APPEND rgw_libs ${LUA_LIBRARIES})
+
+if(WITH_RADOSGW_LUA_PACKAGES)
+  list(APPEND rgw_libs Boost::filesystem)
+endif()
 
 set(rgw_schedulers_srcs
   rgw_dmclock_scheduler_ctx.cc

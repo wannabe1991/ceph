@@ -607,6 +607,8 @@ public:
 			      size_t read_len,
 			      bufferlist* bl);
 
+  size_t probe_alloc_avail(int dev, uint64_t alloc_size);
+
   /// test purpose methods
   const PerfCounters* get_perf_counters() const {
     return logger;
@@ -648,6 +650,17 @@ public:
   uint8_t select_prefer_bdev(void* hint) override;
   void get_paths(const std::string& base, paths& res) const override;
   void dump(std::ostream& sout) override;
+};
+
+class FitToFastVolumeSelector : public OriginalVolumeSelector {
+public:
+  FitToFastVolumeSelector(
+    uint64_t _wal_total,
+    uint64_t _db_total,
+    uint64_t _slow_total)
+    : OriginalVolumeSelector(_wal_total, _db_total, _slow_total) {}
+
+  void get_paths(const std::string& base, paths& res) const override;
 };
 
 #endif

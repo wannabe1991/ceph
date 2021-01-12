@@ -634,6 +634,7 @@ private:
   void reencode_full_map(ceph::buffer::list& bl, uint64_t features);
 public:
   void count_metadata(const std::string& field, std::map<std::string,int> *out);
+  void get_versions(std::map<std::string, std::list<std::string>> &versions);
 protected:
   int get_osd_objectstore_type(int osd, std::string *type);
   bool is_pool_currently_all_bluestore(int64_t pool_id, const pg_pool_t &pool,
@@ -676,7 +677,7 @@ protected:
   void set_default_laggy_params(int target_osd);
 
 public:
-  OSDMonitor(CephContext *cct, Monitor *mn, Paxos *p, const std::string& service_name);
+  OSDMonitor(CephContext *cct, Monitor &mn, Paxos &p, const std::string& service_name);
 
   void tick() override;  // check state, take actions
 

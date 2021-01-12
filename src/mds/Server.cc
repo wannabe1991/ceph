@@ -174,6 +174,9 @@ void Server::create_logger()
                       PerfCountersBuilder::PRIO_INTERESTING);
   plb.add_u64_counter(l_mdss_cap_revoke_eviction, "cap_revoke_eviction",
                       "Cap Revoke Client Eviction", "cre", PerfCountersBuilder::PRIO_INTERESTING);
+  plb.add_u64_counter(l_mdss_cap_acquisition_throttle,
+                      "cap_acquisition_throttle", "Cap acquisition throttle counter", "cat",
+                      PerfCountersBuilder::PRIO_INTERESTING);
 
   // fop latencies are useful
   plb.set_prio_default(PerfCountersBuilder::PRIO_USEFUL);
@@ -255,6 +258,10 @@ Server::Server(MDSRank *m, MetricsHandler *metrics_handler) :
   cap_revoke_eviction_timeout = g_conf().get_val<double>("mds_cap_revoke_eviction_timeout");
   max_snaps_per_dir = g_conf().get_val<uint64_t>("mds_max_snaps_per_dir");
   delegate_inos_pct = g_conf().get_val<uint64_t>("mds_client_delegate_inos_pct");
+  max_caps_per_client = g_conf().get_val<uint64_t>("mds_max_caps_per_client");
+  cap_acquisition_throttle = g_conf().get_val<uint64_t>("mds_session_cap_acquisition_throttle");
+  max_caps_throttle_ratio = g_conf().get_val<double>("mds_session_max_caps_throttle_ratio");
+  caps_throttle_retry_request_timeout = g_conf().get_val<double>("mds_cap_acquisition_throttle_retry_request_timeout");
   supported_features = feature_bitset_t(CEPHFS_FEATURES_MDS_SUPPORTED);
 }
 
@@ -1221,6 +1228,18 @@ void Server::handle_conf_change(const std::set<std::string>& changed) {
   }
   if (changed.count("mds_client_delegate_inos_pct")) {
     delegate_inos_pct = g_conf().get_val<uint64_t>("mds_client_delegate_inos_pct");
+  }
+  if (changed.count("mds_max_caps_per_client")) {
+    max_caps_per_client = g_conf().get_val<uint64_t>("mds_max_caps_per_client");
+  }
+  if (changed.count("mds_session_cap_acquisition_throttle")) {
+    cap_acquisition_throttle = g_conf().get_val<uint64_t>("mds_session_cap_acquisition_throttle");
+  }
+  if (changed.count("mds_session_max_caps_throttle_ratio")) {
+    max_caps_throttle_ratio = g_conf().get_val<double>("mds_session_max_caps_throttle_ratio");
+  }
+  if (changed.count("mds_cap_acquisition_throttle_retry_request_timeout")) {
+    caps_throttle_retry_request_timeout = g_conf().get_val<double>("mds_cap_acquisition_throttle_retry_request_timeout");
   }
 }
 
@@ -3363,23 +3382,6 @@ public:
   }
 };
 
-class CF_MDS_MDRContextFactory : public MDSContextFactory {
-public:
-  CF_MDS_MDRContextFactory(MDCache *cache, MDRequestRef &mdr, bool dl) :
-    mdcache(cache), mdr(mdr), drop_locks(dl) {}
-  MDSContext *build() {
-    if (drop_locks) {
-      mdcache->mds->locker->drop_locks(mdr.get(), nullptr);
-      mdr->drop_local_auth_pins();
-    }
-    return new C_MDS_RetryRequest(mdcache, mdr);
-  }
-private:
-  MDCache *mdcache;
-  MDRequestRef mdr;
-  bool drop_locks;
-};
-
 /* If this returns null, the request has been handled
  * as appropriate: forwarded on, or the client's been replied to */
 CInode* Server::rdlock_path_pin_ref(MDRequestRef& mdr,
@@ -3393,7 +3395,7 @@ CInode* Server::rdlock_path_pin_ref(MDRequestRef& mdr,
     return mdr->in[0];
 
   // traverse
-  CF_MDS_MDRContextFactory cf(mdcache, mdr, true);
+  CF_MDS_RetryRequestFactory cf(mdcache, mdr, true);
   int flags = 0;
   if (refpath.is_last_snap()) {
     if (!no_want_auth)
@@ -3486,7 +3488,7 @@ CDentry* Server::rdlock_path_xlock_dentry(MDRequestRef& mdr,
   }
 
   // traverse to parent dir
-  CF_MDS_MDRContextFactory cf(mdcache, mdr, true);
+  CF_MDS_RetryRequestFactory cf(mdcache, mdr, true);
   int flags = MDS_TRAVERSE_RDLOCK_SNAP | MDS_TRAVERSE_RDLOCK_PATH |
 	      MDS_TRAVERSE_WANT_DENTRY | MDS_TRAVERSE_XLOCK_DENTRY |
 	      MDS_TRAVERSE_WANT_AUTH;
@@ -3581,7 +3583,7 @@ Server::rdlock_two_paths_xlock_destdn(MDRequestRef& mdr, bool xlock_srcdn)
   }
 
   // traverse to parent dir
-  CF_MDS_MDRContextFactory cf(mdcache, mdr, true);
+  CF_MDS_RetryRequestFactory cf(mdcache, mdr, true);
   int flags = MDS_TRAVERSE_RDLOCK_SNAP |  MDS_TRAVERSE_WANT_DENTRY | MDS_TRAVERSE_WANT_AUTH;
   int r = mdcache->path_traverse(mdr, cf, refpath, flags, &mdr->dn[0]);
   if (r != 0) {
@@ -3769,7 +3771,7 @@ void Server::handle_client_getattr(MDRequestRef& mdr, bool is_lookup)
     want_auth = true; // set want_auth for CEPH_STAT_RSTAT mask
 
   if (!mdr->is_batch_head() && mdr->can_batch()) {
-    CF_MDS_MDRContextFactory cf(mdcache, mdr, false);
+    CF_MDS_RetryRequestFactory cf(mdcache, mdr, false);
     int r = mdcache->path_traverse(mdr, cf, mdr->get_filepath(),
 				   (want_auth ? MDS_TRAVERSE_WANT_AUTH : 0),
 				   &mdr->dn[0], &mdr->in[0]);
@@ -4468,6 +4470,7 @@ void Server::handle_client_openc(MDRequestRef& mdr)
 void Server::handle_client_readdir(MDRequestRef& mdr)
 {
   const cref_t<MClientRequest> &req = mdr->client_request;
+  Session *session = mds->get_session(req);
   client_t client = req->get_source().num();
   MutationImpl::LockOpVec lov;
   CInode *diri = rdlock_path_pin_ref(mdr, false, true);
@@ -4479,6 +4482,19 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
     dout(10) << "reply to " << *req << " readdir -ENOTDIR" << dendl;
     respond_to_request(mdr, -ENOTDIR);
     return;
+  }
+
+  auto num_caps = session->get_num_caps();
+  auto session_cap_acquisition = session->get_cap_acquisition();
+
+  if (num_caps > static_cast<uint64_t>(max_caps_per_client * max_caps_throttle_ratio) && session_cap_acquisition >= cap_acquisition_throttle) {
+      dout(20) << "readdir throttled. max_caps_per_client: " << max_caps_per_client << " num_caps: " << num_caps
+	       << " session_cap_acquistion: " << session_cap_acquisition << " cap_acquisition_throttle: " << cap_acquisition_throttle << dendl;
+      if (logger)
+          logger->inc(l_mdss_cap_acquisition_throttle);
+
+      mds->timer.add_event_after(caps_throttle_retry_request_timeout, new C_MDS_RetryRequest(mdcache, mdr));
+      return;
   }
 
   lov.add_rdlock(&diri->filelock);
@@ -4679,6 +4695,8 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
     mdcache->lru.lru_touch(dn);
   }
   
+  session->touch_readdir_cap(numfiles);
+
   __u16 flags = 0;
   if (end) {
     flags = CEPH_READDIR_FRAG_END;
@@ -7519,7 +7537,7 @@ void Server::handle_peer_rmdir_prep(MDRequestRef& mdr)
   filepath srcpath(mdr->peer_request->srcdnpath);
   dout(10) << " src " << srcpath << dendl;
   CInode *in;
-  CF_MDS_MDRContextFactory cf(mdcache, mdr, false);
+  CF_MDS_RetryRequestFactory cf(mdcache, mdr, false);
   int r = mdcache->path_traverse(mdr, cf, srcpath,
 				 MDS_TRAVERSE_DISCOVER | MDS_TRAVERSE_PATH_LOCKED,
 				 &trace, &in);
@@ -9063,7 +9081,7 @@ void Server::handle_peer_rename_prep(MDRequestRef& mdr)
   filepath destpath(mdr->peer_request->destdnpath);
   dout(10) << " dest " << destpath << dendl;
   vector<CDentry*> trace;
-  CF_MDS_MDRContextFactory cf(mdcache, mdr, false);
+  CF_MDS_RetryRequestFactory cf(mdcache, mdr, false);
   int r = mdcache->path_traverse(mdr, cf, destpath,
 				 MDS_TRAVERSE_DISCOVER | MDS_TRAVERSE_PATH_LOCKED | MDS_TRAVERSE_WANT_DENTRY,
 				 &trace);
@@ -10208,12 +10226,25 @@ void Server::handle_client_mksnap(MDRequestRef& mdr)
 
   ceph_assert(mds->snapclient->get_cached_version() >= stid);
 
+  SnapPayload payload;
+  if (req->get_data().length()) {
+    try {
+      auto iter = req->get_data().cbegin();
+      decode(payload, iter);
+    } catch (const ceph::buffer::error &e) {
+      // backward compat -- client sends xattr bufferlist. however,
+      // that is not used anywhere -- so (log and) ignore.
+      dout(20) << ": no metadata in payload (old client?)" << dendl;
+    }
+  }
+
   // journal
   SnapInfo info;
   info.ino = diri->ino();
   info.snapid = snapid;
   info.name = snapname;
   info.stamp = mdr->get_op_stamp();
+  info.metadata = payload.metadata;
 
   auto pi = diri->project_inode(mdr, false, true);
   pi.inode->ctime = info.stamp;

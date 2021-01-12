@@ -120,6 +120,16 @@ public:
   get_root_ret get_root(Transaction &t);
 
   /**
+   * get_root_fast
+   *
+   * returns t.root and assume it is already present/read in t
+   */
+  RootBlockRef get_root_fast(Transaction &t) {
+    assert(t.root);
+    return t.root;
+  }
+
+  /**
    * get_extent
    *
    * returns ref to extent at offset~length of type T either from
@@ -481,7 +491,8 @@ private:
   /// alloc buffer for cached extent
   bufferptr alloc_cache_buf(size_t size) {
     // TODO: memory pooling etc
-    auto bp = ceph::bufferptr(size);
+    auto bp = ceph::bufferptr(
+      buffer::create_page_aligned(size));
     bp.zero();
     return bp;
   }

@@ -235,19 +235,49 @@ public:
     laddr_t laddr,
     segment_off_t len) final;
 
+  using scan_extents_cursor =
+    SegmentCleaner::ExtentCallbackInterface::scan_extents_cursor;
+  using scan_extents_ertr =
+    SegmentCleaner::ExtentCallbackInterface::scan_extents_ertr;
   using scan_extents_ret =
     SegmentCleaner::ExtentCallbackInterface::scan_extents_ret;
   scan_extents_ret scan_extents(
-    paddr_t addr,
+    scan_extents_cursor &cursor,
     extent_len_t bytes_to_read) final {
-    return journal.scan_extents(addr, bytes_to_read);
+    return journal.scan_extents(cursor, bytes_to_read);
   }
 
   using release_segment_ret =
     SegmentCleaner::ExtentCallbackInterface::release_segment_ret;
   release_segment_ret release_segment(
-    segment_id_t id) {
+    segment_id_t id) final {
     return segment_manager.release(id);
+  }
+
+  /**
+   * read_onode_root
+   *
+   * Get onode-tree root logical address
+   */
+  using read_onode_root_ertr = crimson::errorator<
+    crimson::ct_error::input_output_error
+    >;
+  using read_onode_root_ret = read_onode_root_ertr::future<laddr_t>;
+  read_onode_root_ret read_onode_root(Transaction &t) {
+    return cache.get_root(t).safe_then([](auto croot) {
+      return croot->get_root().onode_root;
+    });
+  }
+
+  /**
+   * write_onode_root
+   *
+   * Write onode-tree root logical address, must be called after read.
+   */
+  void write_onode_root(Transaction &t, laddr_t addr) {
+    auto croot = cache.get_root_fast(t);
+    croot = cache.duplicate_for_write(t, croot)->cast<RootBlock>();
+    croot->get_root().onode_root = addr;
   }
 
   ~TransactionManager();

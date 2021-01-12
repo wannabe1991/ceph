@@ -8,8 +8,8 @@ import {
   TREE_ACTIONS
 } from '@circlon/angular-tree-component';
 
-import { HealthService } from '../../../shared/api/health.service';
-import { Icons } from '../../../shared/enum/icons.enum';
+import { HealthService } from '~/app/shared/api/health.service';
+import { Icons } from '~/app/shared/enum/icons.enum';
 
 @Component({
   selector: 'cd-crushmap',
@@ -24,6 +24,7 @@ export class CrushmapComponent implements OnInit {
   nodes: any[] = [];
   treeOptions: ITreeOptions = {
     useVirtualScroll: true,
+    nodeHeight: 22,
     actionMapping: {
       mouse: {
         click: this.onNodeSelected.bind(this)

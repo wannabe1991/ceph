@@ -170,8 +170,8 @@ bool ObjectRequest<I>::compute_parent_extents(Extents *parent_extents,
     return false;
   }
 
-  Striper::extent_to_file(m_ictx->cct, &m_ictx->layout, m_object_no, 0,
-                          m_ictx->layout.object_size, *parent_extents);
+  io::util::extent_to_file(m_ictx, m_object_no, 0, m_ictx->layout.object_size,
+                           *parent_extents);
   uint64_t object_overlap = m_ictx->prune_parent_extents(*parent_extents,
                                                          parent_overlap);
   if (object_overlap > 0) {
@@ -232,7 +232,7 @@ void ObjectReadRequest<I>::read_object() {
   }
   image_locker.unlock();
 
-  ldout(image_ctx->cct, 20) << dendl;
+  ldout(image_ctx->cct, 20) << "snap_id=" << read_snap_id << dendl;
 
   neorados::ReadOp read_op;
   for (auto& extent: *this->m_extents) {
@@ -258,6 +258,9 @@ template <typename I>
 void ObjectReadRequest<I>::handle_read_object(int r) {
   I *image_ctx = this->m_ictx;
   ldout(image_ctx->cct, 20) << "r=" << r << dendl;
+  if (m_version != nullptr) {
+    ldout(image_ctx->cct, 20) << "version=" << *m_version << dendl;
+  }
 
   if (r == -ENOENT) {
     read_parent();
@@ -485,14 +488,16 @@ void AbstractObjectWriteRequest<I>::write_object() {
 
   neorados::WriteOp write_op;
   if (m_copyup_enabled) {
-    ldout(image_ctx->cct, 20) << "guarding write" << dendl;
     if (m_guarding_migration_write) {
+      auto snap_seq = (this->m_io_context->write_snap_context() ?
+          this->m_io_context->write_snap_context()->first : 0);
+      ldout(image_ctx->cct, 20) << "guarding write: snap_seq=" << snap_seq
+                                << dendl;
+
       cls_client::assert_snapc_seq(
-        &write_op,
-        (this->m_io_context->write_snap_context() ?
-          this->m_io_context->write_snap_context()->first : 0),
-        cls::rbd::ASSERT_SNAPC_SEQ_LE_SNAPSET_SEQ);
+        &write_op, snap_seq, cls::rbd::ASSERT_SNAPC_SEQ_LE_SNAPSET_SEQ);
     } else {
+      ldout(image_ctx->cct, 20) << "guarding write" << dendl;
       write_op.assert_exists();
     }
   }
@@ -642,12 +647,17 @@ void AbstractObjectWriteRequest<I>::handle_post_write_object_map_update(int r) {
 }
 
 template <typename I>
-void ObjectWriteRequest<I>::add_write_ops(neorados::WriteOp* wr) {
+void ObjectWriteRequest<I>::add_write_hint(neorados::WriteOp* wr) {
   if ((m_write_flags & OBJECT_WRITE_FLAG_CREATE_EXCLUSIVE) != 0) {
     wr->create(true);
   } else if (m_assert_version.has_value()) {
     wr->assert_version(m_assert_version.value());
   }
+  AbstractObjectWriteRequest<I>::add_write_hint(wr);
+}
+
+template <typename I>
+void ObjectWriteRequest<I>::add_write_ops(neorados::WriteOp* wr) {
   if (this->m_full_object) {
     wr->write_full(bufferlist{m_write_data});
   } else {
@@ -704,9 +714,8 @@ int ObjectCompareAndWriteRequest<I>::filter_write_result(int r) const {
 
     // object extent compare mismatch
     uint64_t offset = -MAX_ERRNO - r;
-    Striper::extent_to_file(image_ctx->cct, &image_ctx->layout,
-                            this->m_object_no, offset, this->m_object_len,
-                            image_extents);
+    io::util::extent_to_file(image_ctx, this->m_object_no, offset,
+                             this->m_object_len, image_extents);
     ceph_assert(image_extents.size() == 1);
 
     if (m_mismatch_offset) {
@@ -845,7 +854,8 @@ void ObjectListSnapsRequest<I>::handle_list_snaps(int r) {
                    << "clone_end_snap_id=" << clone_end_snap_id << ", "
                    << "diff=" << diff << ", "
                    << "end_size=" << end_size << ", "
-                   << "exists=" << exists << dendl;
+                   << "exists=" << exists << ", "
+                   << "whole_object=" << read_whole_object << dendl;
     if (end_snap_id <= first_snap_id) {
       // don't include deltas from the starting snapshots, but we iterate over
       // it to track its existence and size
@@ -951,8 +961,8 @@ void ObjectListSnapsRequest<I>::list_from_parent() {
   // calculate reverse mapping onto the parent image
   Extents parent_image_extents;
   for (auto [object_off, object_len]: m_object_extents) {
-    Striper::extent_to_file(cct, &image_ctx->layout, this->m_object_no,
-                            object_off, object_len, parent_image_extents);
+    io::util::extent_to_file(image_ctx, this->m_object_no, object_off,
+                             object_len, parent_image_extents);
   }
 
   uint64_t parent_overlap = 0;
@@ -1014,8 +1024,8 @@ void ObjectListSnapsRequest<I>::handle_list_from_parent(int r) {
 
       // map image-extents back to this object
       striper::LightweightObjectExtents object_extents;
-      Striper::file_to_extents(cct, &image_ctx->layout, image_extent.get_off(),
-                               image_extent.get_len(), 0, 0, &object_extents);
+      io::util::file_to_extents(image_ctx, image_extent.get_off(),
+                                image_extent.get_len(), 0, &object_extents);
       for (auto& object_extent : object_extents) {
         ceph_assert(object_extent.object_no == this->m_object_no);
         intervals.insert(

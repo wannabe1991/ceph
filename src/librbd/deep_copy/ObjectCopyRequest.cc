@@ -8,12 +8,14 @@
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ObjectMap.h"
 #include "librbd/Utils.h"
+#include "librbd/asio/ContextWQ.h"
 #include "librbd/deep_copy/Handler.h"
 #include "librbd/io/AioCompletion.h"
 #include "librbd/io/AsyncOperation.h"
 #include "librbd/io/ImageDispatchSpec.h"
 #include "librbd/io/ObjectDispatcherInterface.h"
 #include "librbd/io/ReadResult.h"
+#include "librbd/io/Utils.h"
 #include "osdc/Striper.h"
 
 #define dout_subsys ceph_subsys_rbd
@@ -24,6 +26,7 @@
 namespace librbd {
 namespace deep_copy {
 
+using librbd::util::create_async_context_callback;
 using librbd::util::create_context_callback;
 using librbd::util::create_rados_callback;
 
@@ -34,13 +37,13 @@ ObjectCopyRequest<I>::ObjectCopyRequest(I *src_image_ctx,
                                         librados::snap_t dst_snap_id_start,
                                         const SnapMap &snap_map,
                                         uint64_t dst_object_number,
-                                        bool flatten, Handler* handler,
+                                        uint32_t flags, Handler* handler,
                                         Context *on_finish)
   : m_src_image_ctx(src_image_ctx),
     m_dst_image_ctx(dst_image_ctx), m_cct(dst_image_ctx->cct),
     m_src_snap_id_start(src_snap_id_start),
     m_dst_snap_id_start(dst_snap_id_start), m_snap_map(snap_map),
-    m_dst_object_number(dst_object_number), m_flatten(flatten),
+    m_dst_object_number(dst_object_number), m_flags(flags),
     m_handler(handler), m_on_finish(on_finish) {
   ceph_assert(src_image_ctx->data_ctx.is_valid());
   ceph_assert(dst_image_ctx->data_ctx.is_valid());
@@ -65,9 +68,9 @@ void ObjectCopyRequest<I>::send() {
 template <typename I>
 void ObjectCopyRequest<I>::send_list_snaps() {
   // image extents are consistent across src and dst so compute once
-  Striper::extent_to_file(m_cct, &m_dst_image_ctx->layout, m_dst_object_number,
-                          0, m_dst_image_ctx->layout.object_size,
-                          m_image_extents);
+  io::util::extent_to_file(
+          m_dst_image_ctx, m_dst_object_number, 0,
+          m_dst_image_ctx->layout.object_size, m_image_extents);
   ldout(m_cct, 20) << "image_extents=" << m_image_extents << dendl;
 
   io::SnapIds snap_ids;
@@ -83,8 +86,9 @@ void ObjectCopyRequest<I>::send_list_snaps() {
 
   m_snapshot_delta.clear();
 
-  auto ctx = create_context_callback<
-    ObjectCopyRequest, &ObjectCopyRequest<I>::handle_list_snaps>(this);
+  auto ctx = create_async_context_callback(
+    *m_src_image_ctx, create_context_callback<
+      ObjectCopyRequest, &ObjectCopyRequest<I>::handle_list_snaps>(this));
   auto aio_comp = io::AioCompletion::create_and_start(
     ctx, util::get_image_ctx(m_src_image_ctx), io::AIO_TYPE_GENERIC);
   auto req = io::ImageDispatchSpec::create_list_snaps(
@@ -274,8 +278,14 @@ void ObjectCopyRequest<I>::process_copyup() {
 
   // let dispatch layers have a chance to process the data but
   // assume that the dispatch layer will only touch the sparse bufferlist
-  m_dst_image_ctx->io_object_dispatcher->prepare_copyup(
+  auto r = m_dst_image_ctx->io_object_dispatcher->prepare_copyup(
     m_dst_object_number, &m_snapshot_sparse_bufferlist);
+  if (r < 0) {
+    lderr(m_cct) << "failed to prepare copyup data: " << cpp_strerror(r)
+                 << dendl;
+    finish(r);
+    return;
+  }
 
   send_write_object();
 }
@@ -329,7 +339,10 @@ void ObjectCopyRequest<I>::send_write_object() {
                    << "dst_snaps=" << dst_snap_ids << dendl;
 
   librados::ObjectWriteOperation op;
-  if (!m_dst_image_ctx->migration_info.empty()) {
+
+  bool migration = ((m_flags & OBJECT_COPY_REQUEST_FLAG_MIGRATION) != 0);
+  if (migration) {
+    ldout(m_cct, 20) << "assert_snapc_seq=" << dst_snap_seq << dendl;
     cls_client::assert_snapc_seq(&op, dst_snap_seq,
                                  cls::rbd::ASSERT_SNAPC_SEQ_GT_SNAPSET_SEQ);
   }
@@ -370,7 +383,7 @@ void ObjectCopyRequest<I>::send_write_object() {
     }
   }
 
-  if (op.size() == (m_dst_image_ctx->migration_info.empty() ? 0 : 1)) {
+  if (op.size() == (migration ? 1 : 0)) {
     handle_write_object(0);
     return;
   }
@@ -502,7 +515,8 @@ void ObjectCopyRequest<I>::compute_read_ops() {
     }
   }
 
-  if (!dne_image_interval.empty() && (!only_dne_extents || m_flatten)) {
+  bool flatten = ((m_flags & OBJECT_COPY_REQUEST_FLAG_FLATTEN) != 0);
+  if (!dne_image_interval.empty() && (!only_dne_extents || flatten)) {
     auto snap_map_it = m_snap_map.begin();
     ceph_assert(snap_map_it != m_snap_map.end());
 
@@ -575,8 +589,8 @@ void ObjectCopyRequest<I>::merge_write_ops() {
     for (auto [image_offset, image_length] : read_op.image_extent_map) {
       // convert image extents back to object extents for the write op
       striper::LightweightObjectExtents object_extents;
-      Striper::file_to_extents(m_cct, &m_dst_image_ctx->layout, image_offset,
-                               image_length, 0, buffer_offset, &object_extents);
+      io::util::file_to_extents(m_dst_image_ctx, image_offset,
+                                image_length, buffer_offset, &object_extents);
       for (auto& object_extent : object_extents) {
         ldout(m_cct, 20) << "src_snap_seq=" << src_snap_seq << ", "
                          << "object_offset=" << object_extent.offset << ", "
@@ -719,8 +733,8 @@ void ObjectCopyRequest<I>::compute_zero_ops() {
     for (auto z = zero_interval.begin(); z != zero_interval.end(); ++z) {
       // convert image extents back to object extents for the write op
       striper::LightweightObjectExtents object_extents;
-      Striper::file_to_extents(m_cct, &m_dst_image_ctx->layout, z.get_start(),
-                               z.get_len(), 0, 0, &object_extents);
+      io::util::file_to_extents(m_dst_image_ctx, z.get_start(), z.get_len(), 0,
+                                &object_extents);
       for (auto& object_extent : object_extents) {
         ceph_assert(object_extent.offset + object_extent.length <=
                       m_dst_image_ctx->layout.object_size);

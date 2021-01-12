@@ -12,6 +12,7 @@
  *
  */
 
+#include <limits>
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -70,7 +71,9 @@ KernelDevice::KernelDevice(CephContext* cct, aio_callback_t cb, void *cbpriv, ai
   unsigned int iodepth = cct->_conf->bdev_aio_max_queue_depth;
 
   if (use_ioring && ioring_queue_t::supported()) {
-    io_queue = std::make_unique<ioring_queue_t>(iodepth);
+    bool use_ioring_hipri = cct->_conf.get_val<bool>("bdev_ioring_hipri");
+    bool use_ioring_sqthread_poll = cct->_conf.get_val<bool>("bdev_ioring_sqthread_poll");
+    io_queue = std::make_unique<ioring_queue_t>(iodepth, use_ioring_hipri, use_ioring_sqthread_poll);
   } else {
     static bool once;
     if (use_ioring && !once) {
@@ -811,6 +814,8 @@ void KernelDevice::aio_submit(IOContext *ioc)
 
   void *priv = static_cast<void*>(ioc);
   int r, retries = 0;
+  // num of pending aios should not overflow when passed to submit_batch()
+  assert(pending <= std::numeric_limits<uint16_t>::max());
   r = io_queue->submit_batch(ioc->running_aios.begin(), e,
 			     pending, priv, &retries);
 

@@ -267,11 +267,11 @@ bool CDir::check_rstats(bool scrub)
   // rstat
   if (!nest_info.same_sums(fnode->rstat)) {
     dout(1) << "mismatch between child accounted_rstats and my rstats!" << dendl;
-    dout(1) << "total of child dentrys: " << nest_info << dendl;
+    dout(1) << "total of child dentries: " << nest_info << dendl;
     dout(1) << "my rstats:              " << fnode->rstat << dendl;
     good = false;
   } else {
-    dout(20) << "total of child dentrys: " << nest_info << dendl;
+    dout(20) << "total of child dentries: " << nest_info << dendl;
     dout(20) << "my rstats:              " << fnode->rstat << dendl;
   }
 
@@ -2049,11 +2049,6 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
     wanted_items.clear();
     mark_complete();
     state_clear(STATE_FETCHING);
-
-    if (scrub_infop && scrub_infop->need_scrub_local) {
-      scrub_infop->need_scrub_local = false;
-      scrub_local();
-    }
   }
 
   // open & force frags
@@ -2164,37 +2159,41 @@ public:
 
 class C_IO_Dir_Commit_Ops : public Context {
 public:
-  C_IO_Dir_Commit_Ops(CDir *d, int pr, bufferlist &&bl,
-		      vector<dentry_key_t> &&r, vector<CDir::dentry_commit_item> &&s,
-		      mempool::mds_co::compact_set<mempool::mds_co::string> &&stale) :
+  C_IO_Dir_Commit_Ops(CDir *d, int pr,
+		      vector<CDir::dentry_commit_item> &&s, bufferlist &&bl,
+		      vector<string> &&r,
+		      mempool::mds_co::compact_set<mempool::mds_co::string> &&stales) :
     dir(d), op_prio(pr) {
+    metapool = dir->mdcache->mds->mdsmap->get_metadata_pool();
     version = dir->get_version();
     is_new = dir->is_new();
+    to_set.swap(s);
     dfts.swap(bl);
     to_remove.swap(r);
-    to_set.swap(s);
-    stale_items.swap(stale);
+    stale_items.swap(stales);
   }
 
   void finish(int r) override {
-    dir->_omap_commit_ops(r, op_prio, version, is_new, dfts, to_remove, to_set,
-                          stale_items);
+    dir->_omap_commit_ops(r, op_prio, metapool, version, is_new, to_set, dfts,
+			  to_remove, stale_items);
   }
 
 private:
   CDir *dir;
-  version_t version;
   int op_prio;
+  int64_t metapool;
+  version_t version;
   bool is_new;
-  bufferlist dfts;
-  vector<dentry_key_t> to_remove;
   vector<CDir::dentry_commit_item> to_set;
+  bufferlist dfts;
+  vector<string> to_remove;
   mempool::mds_co::compact_set<mempool::mds_co::string> stale_items;
 };
 
 // This is not locked by mds_lock
-void CDir::_omap_commit_ops(int r, int op_prio, version_t version, bool _new, bufferlist &dfts,
-                            vector<dentry_key_t>& to_remove, vector<dentry_commit_item> &to_set,
+void CDir::_omap_commit_ops(int r, int op_prio, int64_t metapool, version_t version, bool _new,
+			    vector<dentry_commit_item> &to_set, bufferlist &dfts,
+                            vector<string>& to_remove,
 			    mempool::mds_co::compact_set<mempool::mds_co::string> &stales)
 {
   dout(10) << __func__ << dendl;
@@ -2210,7 +2209,7 @@ void CDir::_omap_commit_ops(int r, int op_prio, version_t version, bool _new, bu
 
   SnapContext snapc;
   object_t oid = get_ondisk_object();
-  object_locator_t oloc(mdcache->mds->mdsmap->get_metadata_pool());
+  object_locator_t oloc(metapool);
 
   map<string, bufferlist> _set;
   set<string> _rm;
@@ -2254,30 +2253,27 @@ void CDir::_omap_commit_ops(int r, int op_prio, version_t version, bool _new, bu
   };
 
   for (auto &key : stales) {
-    write_size += key.length();
-    _rm.emplace(key);
-
-    if (write_size >= max_write_size)
+    unsigned size = key.length() + sizeof(__u32);
+    if (write_size + size > max_write_size)
       commit_one();
+
+    write_size += size;
+    _rm.emplace(key);
   }
 
-  for (auto &k : to_remove) {
-    string key;
-    k.encode(key);
-    write_size += key.length();
-    _rm.emplace(std::move(key));
-
-    if (write_size >= max_write_size)
+  for (auto &key : to_remove) {
+    unsigned size = key.length() + sizeof(__u32);
+    if (write_size + size > max_write_size)
       commit_one();
+
+    write_size += size;
+    _rm.emplace(std::move(key));
   }
 
   uint64_t off = 0;
   bufferlist bl;
   using ceph::encode;
   for (auto &item : to_set) {
-    string key;
-    item.key.encode(key);
-
     encode(item.first, bl);
     if (item.is_remote) {
       bl.append('L');         // remote link
@@ -2317,10 +2313,12 @@ void CDir::_omap_commit_ops(int r, int op_prio, version_t version, bool _new, bu
     }
     off += item.dft_len;
 
-    write_size += key.length() + bl.length();
-    _set[std::move(key)].swap(bl);
-    if (write_size >= max_write_size)
+    unsigned size = item.key.length() + bl.length() + 2 * sizeof(__u32);
+    if (write_size + size > max_write_size)
       commit_one();
+
+    write_size += size;
+    _set[std::move(item.key)].swap(bl);
   }
 
   commit_one(true);
@@ -2351,13 +2349,13 @@ void CDir::_omap_commit(int op_prio)
 
   size_t count = 0;
   if (state_test(CDir::STATE_FRAGMENTING) && is_new()) {
-    count = get_num_head_items() && get_num_snap_items();
+    count = get_num_head_items() + get_num_snap_items();
   } else {
     for (elist<CDentry*>::iterator it = dirty_dentries.begin(); !it.end(); ++it)
       ++count;
   }
 
-  vector<dentry_key_t> to_remove;
+  vector<string> to_remove;
   // reverve enough memories, which maybe larger than the actually needed
   to_remove.reserve(count);
 
@@ -2368,18 +2366,19 @@ void CDir::_omap_commit(int op_prio)
   bufferlist dfts(CEPH_PAGE_SIZE);
 
   auto write_one = [&](CDentry *dn) {
-    auto key = dn->key();
+    string key;
+    dn->key().encode(key);
 
     if (dn->last != CEPH_NOSNAP &&
 	snaps && try_trim_snap_dentry(dn, *snaps)) {
       dout(10) << " rm " << key << dendl;
-      to_remove.push_back(key);
+      to_remove.emplace_back(std::move(key));
       return;
     }
 
     if (dn->get_linkage()->is_null()) {
       dout(10) << " rm " << dn->get_name() << " " << *dn << dendl;
-      to_remove.push_back(key);
+      to_remove.emplace_back(std::move(key));
     } else {
       dout(10) << " set " << dn->get_name() << " " << *dn << dendl;
 
@@ -2391,7 +2390,7 @@ void CDir::_omap_commit(int op_prio)
         dfts.reserve(left + CEPH_PAGE_SIZE);
 
       auto& item = to_set.emplace_back();
-      item.key = key;
+      item.key = std::move(key);
       _parse_dentry(dn, item, snaps, dfts);
       item.dft_len = dfts.length() - off;
     }
@@ -2414,9 +2413,8 @@ void CDir::_omap_commit(int op_prio)
     }
   }
 
-  auto c = new C_IO_Dir_Commit_Ops(this, op_prio, std::move(dfts),
-                                   std::move(to_remove), std::move(to_set),
-                                   std::move(stale_items));
+  auto c = new C_IO_Dir_Commit_Ops(this, op_prio, std::move(to_set), std::move(dfts),
+                                   std::move(to_remove), std::move(stale_items));
   stale_items.clear();
   mdcache->mds->finisher->queue(c);
 }
@@ -2835,6 +2833,17 @@ bool CDir::contains(CDir *x)
   }
 }
 
+bool CDir::can_rep() const
+{
+  if (!is_rep()) 
+    return true;
+
+  unsigned mds_num = mdcache->mds->get_mds_map()->get_num_mds(MDSMap::STATE_ACTIVE);
+  if ((mds_num - 1) > get_replicas().size()) 
+    return true;
+  
+  return false;
+}
 
 
 /** set_dir_auth
@@ -3469,10 +3478,8 @@ void CDir::scrub_info_create() const
 
   std::unique_ptr<scrub_info_t> si(new scrub_info_t());
 
-  si->last_recursive.version = si->recursive_start.version =
-      pf->recursive_scrub_version;
-  si->last_recursive.time = si->recursive_start.time =
-      pf->recursive_scrub_stamp;
+  si->last_recursive.version = pf->recursive_scrub_version;
+  si->last_recursive.time = pf->recursive_scrub_stamp;
 
   si->last_local.version = pf->localized_scrub_version;
   si->last_local.time = pf->localized_scrub_stamp;
@@ -3480,209 +3487,60 @@ void CDir::scrub_info_create() const
   me->scrub_infop.swap(si);
 }
 
-void CDir::scrub_initialize(const ScrubHeaderRefConst& header)
+void CDir::scrub_initialize(const ScrubHeaderRef& header)
 {
-  dout(20) << __func__ << dendl;
-  ceph_assert(is_complete());
-  ceph_assert(header != nullptr);
-
+  ceph_assert(header);
   // FIXME: weird implicit construction, is someone else meant
   // to be calling scrub_info_create first?
   scrub_info();
-  ceph_assert(scrub_infop && !scrub_infop->directory_scrubbing);
-
-  scrub_infop->recursive_start.version = get_projected_version();
-  scrub_infop->recursive_start.time = ceph_clock_now();
-
-  scrub_infop->directories_to_scrub.clear();
-  scrub_infop->directories_scrubbing.clear();
-  scrub_infop->directories_scrubbed.clear();
-  scrub_infop->others_to_scrub.clear();
-  scrub_infop->others_scrubbing.clear();
-  scrub_infop->others_scrubbed.clear();
-
-  for (auto i = items.begin();
-      i != items.end();
-      ++i) {
-    // TODO: handle snapshot scrubbing
-    if (i->first.snapid != CEPH_NOSNAP)
-      continue;
-
-    CDentry::linkage_t *dnl = i->second->get_projected_linkage();
-    if (dnl->is_primary()) {
-      if (dnl->get_inode()->is_dir())
-	scrub_infop->directories_to_scrub.insert(i->first);
-      else
-	scrub_infop->others_to_scrub.insert(i->first);
-    } else if (dnl->is_remote()) {
-      // TODO: check remote linkage
-    }
-  }
   scrub_infop->directory_scrubbing = true;
   scrub_infop->header = header;
+  header->inc_num_pending();
+}
+
+void CDir::scrub_aborted() {
+  dout(20) << __func__ << dendl;
+  ceph_assert(scrub_is_in_progress());
+
+  scrub_infop->last_scrub_dirty = false;
+  scrub_infop->directory_scrubbing = false;
+  scrub_infop->header->dec_num_pending();
+  scrub_infop.reset();
 }
 
 void CDir::scrub_finished()
 {
   dout(20) << __func__ << dendl;
-  ceph_assert(scrub_infop && scrub_infop->directory_scrubbing);
+  ceph_assert(scrub_is_in_progress());
 
-  ceph_assert(scrub_infop->directories_to_scrub.empty());
-  ceph_assert(scrub_infop->directories_scrubbing.empty());
-  scrub_infop->directories_scrubbed.clear();
-  ceph_assert(scrub_infop->others_to_scrub.empty());
-  ceph_assert(scrub_infop->others_scrubbing.empty());
-  scrub_infop->others_scrubbed.clear();
-  scrub_infop->directory_scrubbing = false;
+  scrub_infop->last_local.time = ceph_clock_now();
+  scrub_infop->last_local.version = get_version();
+  if (scrub_infop->header->get_recursive())
+    scrub_infop->last_recursive = scrub_infop->last_local;
 
-  scrub_infop->last_recursive = scrub_infop->recursive_start;
   scrub_infop->last_scrub_dirty = true;
-}
 
-int CDir::_next_dentry_on_set(dentry_key_set &dns, bool missing_okay,
-                              MDSContext *cb, CDentry **dnout)
-{
-  dentry_key_t dnkey;
-  CDentry *dn;
-
-  while (!dns.empty()) {
-    set<dentry_key_t>::iterator front = dns.begin();
-    dnkey = *front;
-    dn = lookup(dnkey.name);
-    if (!dn) {
-      if (!is_complete() &&
-          (!has_bloom() || is_in_bloom(dnkey.name))) {
-        // need to re-read this dirfrag
-        fetch(cb);
-        return EAGAIN;
-      }
-      // okay, we lost it
-      if (missing_okay) {
-	dout(15) << " we no longer have directory dentry "
-		 << dnkey.name << ", assuming it got renamed" << dendl;
-	dns.erase(dnkey);
-	continue;
-      } else {
-	dout(5) << " we lost dentry " << dnkey.name
-		<< ", bailing out because that's impossible!" << dendl;
-	ceph_abort();
-      }
-    }
-    // okay, we got a  dentry
-    dns.erase(dnkey);
-
-    if (dn->get_projected_version() < scrub_infop->last_recursive.version &&
-	!(scrub_infop->header->get_force())) {
-      dout(15) << " skip dentry " << dnkey.name
-	       << ", no change since last scrub" << dendl;
-      continue;
-    }
-
-    if (!dn->get_linkage()->is_primary()) {
-      dout(15) << " skip dentry " << dnkey.name
-	       << ", no longer primary" << dendl;
-      continue;
-    }
-
-    *dnout = dn;
-    return 0;
-  }
-  *dnout = NULL;
-  return ENOENT;
-}
-
-int CDir::scrub_dentry_next(MDSContext *cb, CDentry **dnout)
-{
-  dout(20) << __func__ << dendl;
-  ceph_assert(scrub_infop && scrub_infop->directory_scrubbing);
-
-  dout(20) << "trying to scrub directories underneath us" << dendl;
-  int rval = _next_dentry_on_set(scrub_infop->directories_to_scrub, true,
-                                 cb, dnout);
-  if (rval == 0) {
-    dout(20) << __func__ << " inserted to directories scrubbing: "
-      << *dnout << dendl;
-    scrub_infop->directories_scrubbing.insert((*dnout)->key());
-  } else if (rval == EAGAIN) {
-    // we don't need to do anything else
-  } else { // we emptied out the directory scrub set
-    ceph_assert(rval == ENOENT);
-    dout(20) << "no directories left, moving on to other kinds of dentries"
-             << dendl;
-    
-    rval = _next_dentry_on_set(scrub_infop->others_to_scrub, false, cb, dnout);
-    if (rval == 0) {
-      dout(20) << __func__ << " inserted to others scrubbing: "
-        << *dnout << dendl;
-      scrub_infop->others_scrubbing.insert((*dnout)->key());
-    }
-  }
-  dout(20) << " returning " << rval << " with dn=" << *dnout << dendl;
-  return rval;
-}
-
-std::vector<CDentry*> CDir::scrub_dentries_scrubbing()
-{
-  dout(20) << __func__ << dendl;
-  ceph_assert(scrub_infop && scrub_infop->directory_scrubbing);
-
-  std::vector<CDentry*> result;
-  for (auto& scrub_info : scrub_infop->directories_scrubbing) {
-    CDentry *d = lookup(scrub_info.name, scrub_info.snapid);
-    ceph_assert(d);
-    result.push_back(d);
-  }
-  for (auto& scrub_info : scrub_infop->others_scrubbing) {
-    CDentry *d = lookup(scrub_info.name, scrub_info.snapid);
-    ceph_assert(d);
-    result.push_back(d);
-  }
-  return result;
-}
-
-void CDir::scrub_dentry_finished(CDentry *dn)
-{
-  dout(20) << __func__ << " on dn " << *dn << dendl;
-  ceph_assert(scrub_infop && scrub_infop->directory_scrubbing);
-  dentry_key_t dn_key = dn->key();
-  if (scrub_infop->directories_scrubbing.erase(dn_key)) {
-    scrub_infop->directories_scrubbed.insert(dn_key);
-  } else {
-    ceph_assert(scrub_infop->others_scrubbing.count(dn_key));
-    scrub_infop->others_scrubbing.erase(dn_key);
-    scrub_infop->others_scrubbed.insert(dn_key);
-  }
+  scrub_infop->directory_scrubbing = false;
+  scrub_infop->header->dec_num_pending();
 }
 
 void CDir::scrub_maybe_delete_info()
 {
   if (scrub_infop &&
       !scrub_infop->directory_scrubbing &&
-      !scrub_infop->need_scrub_local &&
-      !scrub_infop->last_scrub_dirty &&
-      !scrub_infop->pending_scrub_error &&
-      scrub_infop->dirty_scrub_stamps.empty()) {
+      !scrub_infop->last_scrub_dirty)
     scrub_infop.reset();
-  }
 }
 
 bool CDir::scrub_local()
 {
   ceph_assert(is_complete());
-  bool rval = check_rstats(true);
-
-  scrub_info();
-  if (rval) {
-    scrub_infop->last_local.time = ceph_clock_now();
-    scrub_infop->last_local.version = get_projected_version();
-    scrub_infop->pending_scrub_error = false;
-    scrub_infop->last_scrub_dirty = true;
-  } else {
-    scrub_infop->pending_scrub_error = true;
-    if (scrub_infop->header->get_repair())
-      mdcache->repair_dirfrag_stats(this);
+  bool good = check_rstats(true);
+  if (!good && scrub_infop->header->get_repair()) {
+    mdcache->repair_dirfrag_stats(this);
+    scrub_infop->header->set_repaired();
   }
-  return rval;
+  return good;
 }
 
 std::string CDir::get_path() const

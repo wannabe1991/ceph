@@ -36,7 +36,7 @@ class TestNFS(MgrTestCase):
         self.pseudo_path = "/cephfs"
         self.path = "/"
         self.fs_name = "nfs-cephfs"
-        self.expected_name = "nfs.ganesha-test"
+        self.expected_name = "nfs.test"
         self.sample_export = {
          "export_id": 1,
          "path": self.path,
@@ -119,7 +119,7 @@ class TestNFS(MgrTestCase):
         # Disable any running nfs ganesha daemon
         self._check_nfs_server_status()
         self._nfs_cmd('cluster', 'create', self.export_type, self.cluster_id)
-        # Check for expected status and daemon name (nfs.ganesha-<cluster_id>)
+        # Check for expected status and daemon name (nfs.<cluster_id>)
         self._check_nfs_cluster_status('running', 'NFS Ganesha cluster deployment failed')
 
     def _test_delete_cluster(self):
@@ -257,10 +257,11 @@ class TestNFS(MgrTestCase):
                 return
             raise
 
-        if check:
+        try:
             self.ctx.cluster.run(args=['sudo', 'touch', '/mnt/test'])
             out_mnt = self._sys_cmd(['sudo', 'ls', '/mnt'])
             self.assertEqual(out_mnt,  b'test\n')
+        finally:
             self.ctx.cluster.run(args=['sudo', 'umount', '/mnt'])
 
     def test_create_and_delete_cluster(self):
@@ -422,18 +423,35 @@ class TestNFS(MgrTestCase):
         self._cmd('fs', 'volume', 'rm', self.fs_name, '--yes-i-really-mean-it')
         self._test_delete_cluster()
 
+    def test_write_to_read_only_export(self):
+        '''
+        Test write to readonly export.
+        '''
+        self._test_create_cluster()
+        self._create_export(export_id='1', create_fs=True, extra_cmd=[self.pseudo_path, '--readonly'])
+        port, ip = self._get_port_ip_info()
+        try:
+            self._test_mnt(self.pseudo_path, port, ip)
+        except CommandFailedError as e:
+            # Write to cephfs export should fail for test to pass
+            if e.exitstatus != errno.EPERM:
+                raise
+        self._test_delete_cluster()
+
     def test_cluster_info(self):
         '''
         Test cluster info outputs correct ip and hostname
         '''
         self._test_create_cluster()
         info_output = json.loads(self._nfs_cmd('cluster', 'info', self.cluster_id))
+        info_ip = info_output[self.cluster_id][0].pop("ip")
         host_details = {self.cluster_id: [{
             "hostname": self._sys_cmd(['hostname']).decode("utf-8").strip(),
-            "ip": list(set(self._sys_cmd(['hostname', '-I']).decode("utf-8").split())),
             "port": 2049
             }]}
+        host_ip = self._sys_cmd(['hostname', '-I']).decode("utf-8").split()
         self.assertDictEqual(info_output, host_details)
+        self.assertTrue(any([ip in info_ip for ip in host_ip]))
         self._test_delete_cluster()
 
     def test_cluster_set_reset_user_config(self):
@@ -478,7 +496,7 @@ class TestNFS(MgrTestCase):
             'set', self.cluster_id, '-i', '-'], stdin=config)
         time.sleep(30)
         res = self._sys_cmd(['rados', '-p', pool, '-N', self.cluster_id, 'get',
-                             f'userconf-nfs.ganesha-{user_id}', '-'])
+                             f'userconf-nfs.{user_id}', '-'])
         self.assertEqual(config, res.decode('utf-8'))
         self._test_mnt(pseudo_path, port, ip)
         self._nfs_cmd('cluster', 'config', 'reset', self.cluster_id)
